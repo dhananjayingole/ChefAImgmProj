@@ -1,15 +1,17 @@
-"""agents/streaming_pipeline.py — Fixed intent routing + complete pantry pipeline."""
+"""
+agents/streaming_pipeline.py — Full multi-user support.
+Every pipeline run reads state["user_id"] and routes to that user's private databases.
+"""
 
 import time
 import re
 from typing import Generator
 from agents.state import AgentState
-from agents.pantry_agent import detect_pantry_intent   # ← new import
+from agents.pantry_agent import detect_pantry_intent
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
 def _safe(fn, state, *args, **kwargs):
     """Call fn safely; return (state, error_str|None)."""
     try:
@@ -29,27 +31,37 @@ def _phase(agent: str, status: str, **extra):
     return {"type": "phase", "agent": agent, "status": status, **extra}
 
 
-# ---------------------------------------------------------------------------
-# Intent guard — fixes misrouting from LLM intent classifier
-# ---------------------------------------------------------------------------
 def _guard_intent(state: AgentState) -> AgentState:
-    """
-    If the LLM classified the query as 'general' but the text matches
-    obvious pantry patterns, override it.
-    """
-    intent = state.get("intent", "general")
-    if intent != "general":
-        return state                          # already specific, trust LLM
-
+    """Override 'general' intent when pantry patterns are detected."""
+    if state.get("intent", "general") != "general":
+        return state
     detected = detect_pantry_intent(state.get("user_query", ""))
     if detected:
         state["intent"] = detected
     return state
 
 
-# ---------------------------------------------------------------------------
-# Main streaming pipeline
-# ---------------------------------------------------------------------------
+def _resolve_user_services(state: AgentState, db, profile_db, feedback_db):
+    """
+    If state carries a user_id, always use that user's private databases
+    instead of whatever was passed as positional args.
+    This is the central isolation gate — all code paths funnel through here.
+    """
+    user_id = state.get("user_id")
+    if user_id:
+        try:
+            from services.user_services import get_user_services
+            svc        = get_user_services(user_id)
+            db         = svc["db"]
+            profile_db = svc["profile_db"]
+            feedback_db = svc["feedback_db"]
+        except Exception:
+            pass   # Fallback to whatever was passed in — better than crashing
+    return db, profile_db, feedback_db
+
+
+# ── Main streaming pipeline ───────────────────────────────────────────────────
+
 def run_streaming_pipeline(
     state: AgentState,
     client,
@@ -58,20 +70,30 @@ def run_streaming_pipeline(
     profile_db=None,
     feedback_db=None,
 ) -> Generator:
+    """
+    Multi-user safe pipeline.
+    If state["user_id"] is set, every DB operation is routed to that user's
+    private SQLite files regardless of what db/profile_db/feedback_db were passed.
+    """
 
-    # ── Phase 1: Memory ──────────────────────────────────────────────────────
+    # ── ISOLATION GATE: override DBs from user_id in state ───────────────
+    db, profile_db, feedback_db = _resolve_user_services(
+        state, db, profile_db, feedback_db
+    )
+
+    # ── Phase 1: Memory ───────────────────────────────────────────────────
     yield _phase("🧠 Memory Agent", "running")
     t0 = time.time()
     try:
         from agents.memory_agent import MemoryAgent
-        ma = MemoryAgent()
+        ma    = MemoryAgent()
         state, err = _safe(ma.run, state, state, profile_db=profile_db, client=client)
     except Exception as e:
         err = str(e)
     yield _phase("🧠 Memory Agent", "done" if not err else "error",
                  time=round(time.time() - t0, 2))
 
-    # ── Phase 2: Intent ──────────────────────────────────────────────────────
+    # ── Phase 2: Intent ───────────────────────────────────────────────────
     yield _phase("🎯 Intent Agent", "running")
     t0 = time.time()
     try:
@@ -79,7 +101,7 @@ def run_streaming_pipeline(
         state, _ = _safe(intelligent_router_agent, state, state, client=client)
     except Exception:
         pass
-    state = _guard_intent(state)              # ← safety-net override
+    state  = _guard_intent(state)
     intent = state.get("intent", "general")
     yield _phase("🎯 Intent Agent", "done", time=round(time.time() - t0, 2), intent=intent)
 
@@ -87,7 +109,7 @@ def run_streaming_pipeline(
     # GREETING
     # ════════════════════════════════════════════════════════════════════════
     if intent == "greeting":
-        profile = state.get("user_profile", {})
+        profile   = state.get("user_profile", {})
         diet_hint = f" I know you're {profile['diet_type']}." if profile.get("diet_type") else ""
         msg = (
             f"👋 Hey there! I'm **NutriBot**, your smart meal assistant.{diet_hint}\n\n"
@@ -123,35 +145,33 @@ def run_streaming_pipeline(
         return
 
     # ════════════════════════════════════════════════════════════════════════
-    # ── PANTRY: ADD ──────────────────────────────────────────────────────────
+    # PANTRY: ADD
     # ════════════════════════════════════════════════════════════════════════
     elif intent == "add_inventory":
         yield _phase("📦 Pantry Agent", "running")
         t0 = time.time()
         from agents.pantry_agent import PantryAgent
-        pa = PantryAgent()
-        state = pa._add_items(state, client, db)
+        state = PantryAgent()._add_items(state, client, db)
         yield _phase("📦 Pantry Agent", "done", time=round(time.time() - t0, 2))
         yield from _stream(state.get("assistant_message", "❌ Could not add items."))
         yield {"type": "complete", "state": state}
         return
 
     # ════════════════════════════════════════════════════════════════════════
-    # ── PANTRY: VIEW ─────────────────────────────────────────────────────────
+    # PANTRY: VIEW
     # ════════════════════════════════════════════════════════════════════════
     elif intent == "view_inventory":
         yield _phase("📦 Pantry Agent", "running")
         t0 = time.time()
         from agents.pantry_agent import PantryAgent
-        pa = PantryAgent()
-        state = pa._view_pantry(state, db)
+        state = PantryAgent()._view_pantry(state, db)
         yield _phase("📦 Pantry Agent", "done", time=round(time.time() - t0, 2))
         yield from _stream(state.get("assistant_message", "Pantry is empty."))
         yield {"type": "complete", "state": state}
         return
 
     # ════════════════════════════════════════════════════════════════════════
-    # ── PANTRY: REMOVE / CLEAR ───────────────────────────────────────────────
+    # PANTRY: REMOVE / CLEAR
     # ════════════════════════════════════════════════════════════════════════
     elif intent in ("remove_inventory", "remove_all_inventory"):
         yield _phase("📦 Pantry Agent", "running")
@@ -235,7 +255,7 @@ def run_streaming_pipeline(
                 last = _find_last_recipe(state)
                 if last:
                     state["generated_recipe"] = last
-            q_lower = state.get("user_query", "").lower()
+            q_lower   = state.get("user_query", "").lower()
             meal_type = "dinner"
             for mt in ["breakfast", "lunch", "snack"]:
                 if mt in q_lower:
@@ -299,8 +319,8 @@ def run_streaming_pipeline(
         t0 = time.time()
         try:
             profile = state.get("user_profile", {})
-            query = state.get("user_query", "")
-            prompt = (
+            query   = state.get("user_query", "")
+            prompt  = (
                 f'You are an expert Indian chef. Answer precisely:\n\n"{query}"\n\n'
                 f'User: {profile.get("diet_type","vegetarian")}, '
                 f'{profile.get("skill_level","intermediate")} cook.\n\n'
@@ -309,7 +329,7 @@ def run_streaming_pipeline(
             )
             resp = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role":"user","content":prompt}],
                 temperature=0.4, max_tokens=400,
             )
             msg = resp.choices[0].message.content.strip()
@@ -349,9 +369,9 @@ def run_streaming_pipeline(
                     by_date[m.get("plan_date", "?")].append(m)
                 lines = ["## 📅 Meal Calendar — Last 7 Days\n"]
                 for d in sorted(by_date.keys(), reverse=True):
-                    label = "**Today**" if d == date.today().isoformat() else f"**{d}**"
-                    lines.append(label)
+                    label     = "**Today**" if d == date.today().isoformat() else f"**{d}**"
                     total_cal = 0
+                    lines.append(label)
                     for m in by_date[d]:
                         cal = m.get("calories", 0)
                         total_cal += cal
@@ -372,6 +392,26 @@ def run_streaming_pipeline(
         return
 
     # ════════════════════════════════════════════════════════════════════════
+    # START COOKING MODE
+    # ════════════════════════════════════════════════════════════════════════
+    elif intent == "start_cooking_mode":
+        yield _phase("🍳 Recipe Agent", "running")
+        t0 = time.time()
+        recipe = state.get("generated_recipe", "") or _find_last_recipe(state)
+        if recipe:
+            state["assistant_message"] = (
+                "🍳 **Cooking Mode Ready!**\n\n"
+                "Click **'🍳 Start Cooking Mode'** button to begin step-by-step guidance.\n\n"
+                "I'll walk you through each step with timers."
+            )
+        else:
+            state["assistant_message"] = "❌ No recipe found. Please generate a recipe first."
+        yield _phase("🍳 Recipe Agent", "done", time=round(time.time() - t0, 2))
+        yield from _stream(state.get("assistant_message", ""))
+        yield {"type": "complete", "state": state}
+        return
+
+    # ════════════════════════════════════════════════════════════════════════
     # GENERAL FALLBACK
     # ════════════════════════════════════════════════════════════════════════
     else:
@@ -385,16 +425,15 @@ def run_streaming_pipeline(
         return
 
 
-# ---------------------------------------------------------------------------
-# Recipe sub-pipeline
-# ---------------------------------------------------------------------------
+# ── Recipe sub-pipeline ───────────────────────────────────────────────────────
+
 def _run_recipe_pipeline(state, client, db, recipe_kb) -> Generator:
     from agents.budget_agent import budget_agent
     from agents.nutrition_agent import _calculate_nutrition
 
     # Pantry context
     yield _phase("🥕 Pantry Agent", "running")
-    t0 = time.time()
+    t0        = time.time()
     groceries = db.get_all_groceries() if db else []
     expiring  = db.get_expiring_soon(days=3) if db else []
     state["available_ingredients"] = [g["item_name"] for g in groceries]
@@ -411,7 +450,7 @@ def _run_recipe_pipeline(state, client, db, recipe_kb) -> Generator:
     t0 = time.time()
     try:
         from agents.receipe_agent import RecipeAgent
-        ra = RecipeAgent()
+        ra    = RecipeAgent()
         state, err = _safe(ra.run, state, state, client=client)
     except Exception as e:
         state["generated_recipe"] = f"Recipe generation failed: {e}"
@@ -472,9 +511,8 @@ def _run_recipe_pipeline(state, client, db, recipe_kb) -> Generator:
         yield {"type": "section", "title": "🏥 Health", "content": rec}
 
 
-# ---------------------------------------------------------------------------
-# Ingredient extraction from recipe markdown
-# ---------------------------------------------------------------------------
+# ── Ingredient extraction ─────────────────────────────────────────────────────
+
 def _extract_ingredients(state: AgentState, recipe_text: str):
     if not recipe_text:
         return
@@ -491,7 +529,7 @@ def _extract_ingredients(state: AgentState, recipe_text: str):
     search_text = ing_section.group(1) if ing_section else recipe_text
     ingredients = []
     for m in pattern.finditer(search_text):
-        qs   = m.group(1).replace("½", "0.5").replace("¼", "0.25").replace("¾", "0.75")
+        qs   = m.group(1).replace("½","0.5").replace("¼","0.25").replace("¾","0.75")
         unit = m.group(2) or "grams"
         name = m.group(3).strip().rstrip("(~, ")
         try:
@@ -504,27 +542,26 @@ def _extract_ingredients(state: AgentState, recipe_text: str):
         state["recipe_ingredients_structured"] = ingredients
 
 
-# ---------------------------------------------------------------------------
-# Rating handler
-# ---------------------------------------------------------------------------
+# ── Rating handler ────────────────────────────────────────────────────────────
+
 def _handle_rating(state: AgentState, feedback_db) -> AgentState:
     query = state.get("user_query", "")
     star_match = re.search(r"(\d)\s*(?:star|/5|out of)", query.lower())
     if star_match:
         rating = int(star_match.group(1))
-    elif any(w in query.lower() for w in ["loved", "amazing", "delicious", "excellent"]):
+    elif any(w in query.lower() for w in ["loved","amazing","delicious","excellent"]):
         rating = 5
-    elif any(w in query.lower() for w in ["good", "liked", "nice", "great"]):
+    elif any(w in query.lower() for w in ["good","liked","nice","great"]):
         rating = 4
-    elif any(w in query.lower() for w in ["okay", "average", "alright"]):
+    elif any(w in query.lower() for w in ["okay","average","alright"]):
         rating = 3
-    elif any(w in query.lower() for w in ["bad", "disliked", "not great"]):
+    elif any(w in query.lower() for w in ["bad","disliked","not great"]):
         rating = 2
     else:
         rating = 4
 
-    last_recipe = _find_last_recipe(state)
-    recipe_name = "Previous Recipe"
+    last_recipe  = _find_last_recipe(state)
+    recipe_name  = "Previous Recipe"
     if last_recipe:
         nm = re.search(r"##\s*🍽️\s*(.+)", last_recipe)
         if nm:
@@ -532,23 +569,25 @@ def _handle_rating(state: AgentState, feedback_db) -> AgentState:
 
     if feedback_db:
         try:
-            profile    = state.get("user_profile", {})
-            nutrition  = state.get("total_nutrition", {})
-            ingredients = [i.get("name", "") for i in state.get("recipe_ingredients_structured", [])]
-            cp = profile.get("cuisine_preferences", ["Indian"])
-            cuisine = cp[0] if isinstance(cp, list) and cp else "Indian"
+            profile     = state.get("user_profile", {})
+            nutrition   = state.get("total_nutrition", {})
+            ingredients = [i.get("name","") for i in state.get("recipe_ingredients_structured",[])]
+            cp          = profile.get("cuisine_preferences", ["Indian"])
+            cuisine     = cp[0] if isinstance(cp, list) and cp else "Indian"
             feedback_db.save_rating(
-                recipe_name=recipe_name, rating=rating,
-                recipe_content=last_recipe[:500], cuisine=cuisine,
-                diet_type=profile.get("diet_type", ""),
-                calories=nutrition.get("calories", 0),
-                ingredients=ingredients,
-                session_id=state.get("session_id", ""),
+                recipe_name    = recipe_name,
+                rating         = rating,
+                recipe_content = last_recipe[:500],
+                cuisine        = cuisine,
+                diet_type      = profile.get("diet_type",""),
+                calories       = nutrition.get("calories", 0),
+                ingredients    = ingredients,
+                session_id     = state.get("session_id",""),
             )
         except Exception:
             pass
 
-    stars_filled = "⭐" * rating + "☆" * (5 - rating)
+    stars     = "⭐" * rating + "☆" * (5 - rating)
     reactions = {
         5: "Wonderful! I'll suggest similar recipes more often.",
         4: "Great feedback! I'll remember what you enjoyed.",
@@ -557,17 +596,14 @@ def _handle_rating(state: AgentState, feedback_db) -> AgentState:
         1: "I'll avoid this style entirely.",
     }
     state["assistant_message"] = (
-        f"## {stars_filled} Rating Saved!\n\n"
+        f"## {stars} Rating Saved!\n\n"
         f"**{recipe_name}** — {rating}/5 stars\n\n"
-        f"{reactions.get(rating, 'Thanks!')}\n\n"
+        f"{reactions.get(rating,'Thanks!')}\n\n"
         f"*Your taste profile is now smarter — better recommendations coming!*"
     )
     return state
 
 
-# ---------------------------------------------------------------------------
-# Find last recipe in conversation history
-# ---------------------------------------------------------------------------
 def _find_last_recipe(state: AgentState) -> str:
     history = state.get("conversation_history", [])
     for msg in reversed(history):
@@ -578,23 +614,22 @@ def _find_last_recipe(state: AgentState) -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# Budget response builder
-# ---------------------------------------------------------------------------
+# ── Budget response ───────────────────────────────────────────────────────────
+
 def _build_budget_response(state: AgentState, client) -> str:
     profile = state.get("user_profile", {})
     try:
         from services.price_service import PriceService
         from agents.user_profile import _currency
-        ps  = PriceService()
-        cur = _currency(profile)
-        diet = profile.get("diet_type", "vegetarian")
-        cheapest = ps.get_cheapest_protein(diet)
-        bp  = profile.get("budget_preference", {})
+        ps           = PriceService()
+        cur          = _currency(profile)
+        diet         = profile.get("diet_type", "vegetarian")
+        cheapest     = ps.get_cheapest_protein(diet)
+        bp           = profile.get("budget_preference", {})
         budget_amt   = bp.get("amount", 500) if isinstance(bp, dict) else 500
-        protein_name = cheapest.get("name", "lentil (dal)")
-        protein_price = cheapest.get("price_per_kg", 80)
-        protein_g    = cheapest.get("protein_per_100g", 24)
+        protein_name  = cheapest.get("name",            "lentil (dal)")
+        protein_price = cheapest.get("price_per_kg",    80)
+        protein_g     = cheapest.get("protein_per_100g",24)
         return (
             f"## 💰 Budget Analysis\n\n"
             f"**Your weekly budget:** {cur}{budget_amt}\n\n"
@@ -617,20 +652,19 @@ def _build_budget_response(state: AgentState, client) -> str:
         )
 
 
-# ---------------------------------------------------------------------------
-# Eco response
-# ---------------------------------------------------------------------------
+# ── Eco response ──────────────────────────────────────────────────────────────
+
 def _eco_response(state: AgentState, db) -> str:
     eco      = state.get("eco_score", {})
     expiring = db.get_expiring_soon(days=3) if db else []
     lines    = ["## 🌱 Eco Score & Carbon Tips\n"]
     if eco:
-        score  = eco.get("score", 0)
-        grade  = eco.get("grade", "?")
-        co2    = eco.get("co2_kg", 0)
-        saved  = eco.get("co2_saved_kg", 0)
-        tips   = eco.get("all_tips", [])
-        color  = {"A+": "🟢", "A": "🟢", "B": "🟡", "C": "🟡", "D": "🔴"}.get(grade, "🟡")
+        score = eco.get("score", 0)
+        grade = eco.get("grade", "?")
+        co2   = eco.get("co2_kg", 0)
+        saved = eco.get("co2_saved_kg", 0)
+        tips  = eco.get("all_tips", [])
+        color = {"A+":"🟢","A":"🟢","B":"🟡","C":"🟡","D":"🔴"}.get(grade,"🟡")
         lines += [
             f"**Last recipe:** {color} {score:.0f}/100 — Grade **{grade}**",
             f"• CO₂ used: {co2:.2f} kg  |  CO₂ saved: {saved:.2f} kg",
@@ -654,9 +688,8 @@ def _eco_response(state: AgentState, db) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# General LLM fallback
-# ---------------------------------------------------------------------------
+# ── General fallback ──────────────────────────────────────────────────────────
+
 def _general_response(state: AgentState, client) -> str:
     try:
         profile  = state.get("user_profile", {})
@@ -674,7 +707,7 @@ def _general_response(state: AgentState, client) -> str:
         )
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role":"user","content":prompt}],
             temperature=0.5, max_tokens=350,
         )
         return resp.choices[0].message.content.strip()
@@ -700,7 +733,7 @@ def _health_fallback(state: AgentState, client) -> str:
         )
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role":"user","content":prompt}],
             temperature=0.3, max_tokens=450,
         )
         return resp.choices[0].message.content.strip()

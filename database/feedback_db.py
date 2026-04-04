@@ -1,4 +1,6 @@
-"""database/feedback_db.py — Keep as is from your original code."""
+"""
+database/feedback_db.py  — Per-user feedback & ratings database.
+"""
 
 import sqlite3
 import json
@@ -7,12 +9,20 @@ import os
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
+from database.user_db_manager import get_user_connection
+
 
 class FeedbackDatabase:
-    def __init__(self, db_path: str = "data/feedback.db"):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+    """Per-user feedback / ratings store."""
+
+    def __init__(self, user_id: str = "default", db_path: str = None):
+        self.user_id = user_id
+        if db_path:
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+        else:
+            self.conn = get_user_connection(user_id, "feedback.db")
         self._init_tables()
 
     def _init_tables(self):
@@ -45,18 +55,17 @@ class FeedbackDatabase:
         """)
         self.conn.commit()
 
-    def save_rating(self, recipe_name: str, rating: int, recipe_content: str = "",
-                    feedback_text: str = "", cuisine: str = "", diet_type: str = "",
-                    calories: float = 0, ingredients: List[str] = None, session_id: str = "") -> str:
+    def save_rating(self, recipe_name, rating, recipe_content="", feedback_text="",
+                    cuisine="", diet_type="", calories=0, ingredients=None, session_id="") -> str:
         recipe_id = str(uuid.uuid4())[:8]
         self.conn.execute("""
             INSERT INTO recipe_ratings
-            (id, recipe_name, recipe_content, rating, feedback_text, cuisine,
-             diet_type, calories, ingredients_used, session_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id,recipe_name,recipe_content,rating,feedback_text,cuisine,
+             diet_type,calories,ingredients_used,session_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
         """, (recipe_id, recipe_name, recipe_content[:2000], rating, feedback_text,
               cuisine, diet_type, calories, json.dumps(ingredients or []), session_id))
-        
+
         self.conn.execute("""
             INSERT INTO cuisine_stats (cuisine, total_rated, avg_rating)
             VALUES (?, 1, ?)
@@ -64,23 +73,24 @@ class FeedbackDatabase:
                 avg_rating = (avg_rating * total_rated + excluded.avg_rating) / (total_rated + 1),
                 total_rated = total_rated + 1
         """, (cuisine, float(rating)))
-        
+
         for ing in (ingredients or []):
             if ing:
                 self.conn.execute("""
                     INSERT INTO ingredient_preferences (ingredient, like_count, dislike_count)
                     VALUES (?, ?, ?)
                     ON CONFLICT(ingredient) DO UPDATE SET
-                        like_count = like_count + ?,
+                        like_count    = like_count    + ?,
                         dislike_count = dislike_count + ?,
                         last_used = CURRENT_TIMESTAMP
-                """, (ing.lower(), 1 if rating >= 4 else 0, 1 if rating <= 2 else 0,
+                """, (ing.lower(),
+                      1 if rating >= 4 else 0, 1 if rating <= 2 else 0,
                       1 if rating >= 4 else 0, 1 if rating <= 2 else 0))
-        
+
         self.conn.commit()
         return recipe_id
 
-    def get_top_cuisines(self, min_ratings: int = 1) -> List[Dict]:
+    def get_top_cuisines(self, min_ratings=1) -> List[Dict]:
         rows = self.conn.execute("""
             SELECT cuisine, avg_rating, total_rated FROM cuisine_stats
             WHERE total_rated >= ? AND cuisine != ''
@@ -88,7 +98,7 @@ class FeedbackDatabase:
         """, (min_ratings,)).fetchall()
         return [{"cuisine": r[0], "avg_rating": round(r[1], 1), "count": r[2]} for r in rows]
 
-    def get_liked_ingredients(self, min_likes: int = 2) -> List[str]:
+    def get_liked_ingredients(self, min_likes=2) -> List[str]:
         rows = self.conn.execute("""
             SELECT ingredient FROM ingredient_preferences
             WHERE like_count >= ? AND like_count > dislike_count
@@ -98,10 +108,13 @@ class FeedbackDatabase:
 
     def get_preference_summary(self) -> Dict[str, Any]:
         total = self.conn.execute("SELECT COUNT(*) FROM recipe_ratings").fetchone()[0]
-        avg = self.conn.execute("SELECT AVG(rating) FROM recipe_ratings").fetchone()[0]
+        avg   = self.conn.execute("SELECT AVG(rating) FROM recipe_ratings").fetchone()[0]
         return {
             "total_rated": total,
             "avg_rating": round(avg or 0, 1),
             "top_cuisines": self.get_top_cuisines(),
             "liked_ingredients": self.get_liked_ingredients(),
         }
+
+    def close(self):
+        pass

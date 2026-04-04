@@ -1,25 +1,23 @@
-# backend/main.py
 """
-NutriBot Backend API - FastAPI Server
-Complete backend implementation for Android app integration
+backend/main.py — NutriBot Backend API v6.0
+Full per-user data isolation. Every endpoint receives a user_id and
+routes to that user's private database files.
 """
 
 import os
 import sys
 import uuid
-import base64
 import json
 from datetime import datetime, date
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, status
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
-# Add project root to path
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -27,1013 +25,601 @@ if ROOT not in sys.path:
 from dotenv import load_dotenv
 load_dotenv()
 
-# ============================================================================
-# Pydantic Models for API
-# ============================================================================
+# ── Shared / global services (not user-specific) ──────────────────────────────
+_global_client    = None
+_global_recipe_kb = None
 
-class UserMessage(BaseModel):
-    """User message request model"""
-    query: str = Field(..., description="User's message/question")
-    session_id: Optional[str] = Field(None, description="Session ID for conversation continuity")
-    user_id: Optional[str] = Field(None, description="User ID for profile persistence")
-    input_mode: str = Field("text", description="Input mode: text, voice, image")
-    
-    # Optional context
-    dietary_restrictions: Optional[List[str]] = Field(None, description="Dietary restrictions")
-    health_conditions: Optional[List[str]] = Field(None, description="Health conditions")
-    calorie_limit: Optional[int] = Field(500, description="Calorie limit per meal")
-    budget_limit: Optional[float] = Field(500.0, description="Budget limit in INR")
-    servings: Optional[int] = Field(2, description="Number of servings")
-    cuisine_preference: Optional[str] = Field("Indian", description="Cuisine preference")
-
-
-class UserProfileUpdate(BaseModel):
-    """User profile update model"""
-    name: Optional[str] = None
-    diet_type: Optional[str] = None
-    fitness_goal: Optional[str] = None
-    cuisine_preferences: Optional[List[str]] = None
-    allergies: Optional[List[str]] = None
-    health_conditions: Optional[List[str]] = None
-    calorie_goal: Optional[int] = None
-    budget_preference: Optional[Dict[str, Any]] = None
-    cooking_time_preference: Optional[str] = None
-    skill_level: Optional[str] = None
-
-
-class GroceryItemAdd(BaseModel):
-    """Add grocery item model"""
-    item_name: str = Field(..., description="Name of the grocery item")
-    quantity: float = Field(1.0, description="Quantity")
-    unit: str = Field("pieces", description="Unit (kg, g, pieces, etc.)")
-    category: Optional[str] = Field(None, description="Category")
-    is_perishable: bool = Field(False, description="Whether item is perishable")
-    days_until_expiry: Optional[int] = Field(None, description="Days until expiry")
-
-
-class GroceryItemRemove(BaseModel):
-    """Remove grocery item model"""
-    item_name: str = Field(..., description="Name of the grocery item to remove")
-
-
-class MealPlanSave(BaseModel):
-    """Save meal plan model"""
-    plan_date: str = Field(..., description="Date in YYYY-MM-DD format")
-    meal_type: str = Field(..., description="breakfast/lunch/dinner/snack")
-    recipe_name: str = Field(..., description="Name of the recipe")
-    calories: int = Field(0, description="Calories")
-    protein_g: float = Field(0, description="Protein in grams")
-    carbs_g: float = Field(0, description="Carbs in grams")
-    fat_g: float = Field(0, description="Fat in grams")
-    notes: Optional[str] = Field(None, description="Additional notes")
-
-
-class RecipeRating(BaseModel):
-    """Recipe rating model"""
-    recipe_name: str = Field(..., description="Name of the recipe")
-    rating: int = Field(..., ge=1, le=5, description="Rating from 1 to 5")
-    feedback: Optional[str] = Field(None, description="Optional feedback text")
-    cuisine: Optional[str] = Field(None, description="Cuisine type")
-    recipe_content: Optional[str] = Field(None, description="Full recipe content")
-
-
-class APIResponse(BaseModel):
-    """Standard API response model"""
-    success: bool
-    message: str
-    data: Optional[Any] = None
-    error: Optional[str] = None
-
-
-# ============================================================================
-# FastAPI App Setup
-# ============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan manager for startup/shutdown"""
-    global services
-    
-    # Startup - Initialize services
-    print("🚀 Starting NutriBot Backend API...")
-    services = await init_services()
-    print("✅ Services initialized")
-    
+    global _global_client, _global_recipe_kb
+    print("🚀 Starting NutriBot Backend API v6.0 (per-user isolation)...")
+
+    from groq import Groq
+    from tools.tools import load_recipe_dataset, build_recipe_knowledge_base
+
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    _global_client = Groq(api_key=groq_key) if groq_key else None
+
+    dataset       = load_recipe_dataset()
+    _global_recipe_kb = build_recipe_knowledge_base(dataset)
+
+    print("✅ Global services ready")
     yield
-    
-    # Shutdown - Cleanup
-    print("🛑 Shutting down NutriBot Backend...")
-    if services.get("db"):
-        services["db"].conn.close()
+    print("🛑 Shutting down...")
 
 
 app = FastAPI(
     title="NutriBot API",
-    description="Smart Meal Assistant Backend API for Android App",
-    version="5.0.0",
+    description="Smart Meal Assistant — per-user data isolation",
+    version="6.0.0",
     lifespan=lifespan,
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
 )
 
-# CORS middleware for Android app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to your app's domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global services dictionary
-services = {}
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
+
+class UserMessage(BaseModel):
+    query:    str
+    session_id: Optional[str]  = None
+    user_id:    Optional[str]  = "default"
+    input_mode: str            = "text"
+    dietary_restrictions: Optional[List[str]] = None
+    health_conditions:    Optional[List[str]] = None
+    calorie_limit:  Optional[int]   = 500
+    budget_limit:   Optional[float] = 500.0
+    servings:       Optional[int]   = 2
+    cuisine_preference: Optional[str] = "Indian"
 
 
-# ============================================================================
-# Service Initialization
-# ============================================================================
-
-async def init_services():
-    """Initialize all backend services"""
-    from groq import Groq
-    from database.grocery_db import GroceryDatabase
-    from database.feedback_db import FeedbackDatabase
-    from tools.tools import load_recipe_dataset, build_recipe_knowledge_base
-    from agents.user_profile import UserProfileDB
-    from agents.pantry_agent import PantryAgent
-    from agents.cooking_agent import CookingAgent
-    from agents.memory_agent import MemoryAgent
-    from services.price_service import PriceService
-    
-    # Groq client
-    groq_key = os.getenv("GROQ_API_KEY", "")
-    client = Groq(api_key=groq_key) if groq_key else None
-    
-    # Databases
-    db = GroceryDatabase(db_path="data/grocery_inventory.db")
-    profile_db = UserProfileDB(db_path="data/user_profile.db")
-    feedback_db = FeedbackDatabase(db_path="data/feedback.db")
-    
-    # Recipe knowledge base
-    dataset = load_recipe_dataset()
-    recipe_kb = build_recipe_knowledge_base(dataset)
-    
-    # Price service
-    price_service = PriceService()
-    
-    # Agents
-    pantry_agent = PantryAgent()
-    cooking_agent = CookingAgent()
-    memory_agent = MemoryAgent()
-    
-    return {
-        "client": client,
-        "db": db,
-        "recipe_kb": recipe_kb,
-        "profile_db": profile_db,
-        "feedback_db": feedback_db,
-        "price_service": price_service,
-        "pantry_agent": pantry_agent,
-        "cooking_agent": cooking_agent,
-        "memory_agent": memory_agent,
-    }
+class UserProfileUpdate(BaseModel):
+    name:                Optional[str]       = None
+    diet_type:           Optional[str]       = None
+    fitness_goal:        Optional[str]       = None
+    cuisine_preferences: Optional[List[str]] = None
+    allergies:           Optional[List[str]] = None
+    health_conditions:   Optional[List[str]] = None
+    calorie_goal:        Optional[int]       = None
+    budget_preference:   Optional[Dict[str, Any]] = None
+    cooking_time_preference: Optional[str]   = None
+    skill_level:         Optional[str]       = None
 
 
-def get_session_id(user_id: str = None, session_id: str = None) -> str:
-    """Get or create session ID"""
-    if session_id:
-        return session_id
-    if user_id:
-        return f"{user_id}_{datetime.now().strftime('%Y%m%d')}"
-    return str(uuid.uuid4())
+class GroceryItemAdd(BaseModel):
+    item_name:         str
+    quantity:          float = 1.0
+    unit:              str   = "pieces"
+    category:          Optional[str] = None
+    is_perishable:     bool  = False
+    days_until_expiry: Optional[int] = None
 
 
-# ============================================================================
-# Health Check Endpoint
-# ============================================================================
+class GroceryItemRemove(BaseModel):
+    item_name: str
+
+
+class MealPlanSave(BaseModel):
+    plan_date:   str
+    meal_type:   str
+    recipe_name: str
+    calories:    int   = 0
+    protein_g:   float = 0
+    carbs_g:     float = 0
+    fat_g:       float = 0
+    notes:       Optional[str] = None
+
+
+class RecipeRating(BaseModel):
+    recipe_name:    str
+    rating:         int
+    feedback:       Optional[str] = None
+    cuisine:        Optional[str] = None
+    recipe_content: Optional[str] = None
+
+
+class APIResponse(BaseModel):
+    success: bool
+    message: str
+    data:    Optional[Any] = None
+    error:   Optional[str] = None
+
+
+class ParseStepsRequest(BaseModel):
+    recipe_text: str
+
+
+class HealthAdviceRequest(BaseModel):
+    query:   str
+    user_id: Optional[str] = None
+
+
+class ShoppingListRequest(BaseModel):
+    query:   str
+    user_id: Optional[str] = None
+
+
+class WeeklyPlanRequest(BaseModel):
+    query:   str
+    user_id: Optional[str] = None
+
+
+class EcoScoreRequest(BaseModel):
+    ingredients: List[Dict[str, Any]]
+
+
+# ── Helper: resolve user services ─────────────────────────────────────────────
+
+def _get_svc(user_id: Optional[str]):
+    """Return per-user service objects."""
+    from services.user_services import get_user_services
+    return get_user_services(user_id or "default")
+
+
+def _get_state(msg: UserMessage):
+    """Build AgentState from a UserMessage, with user_id threaded through."""
+    from agents.workflow import build_initial_state
+    svc   = _get_svc(msg.user_id)
+    state = build_initial_state(
+        user_query           = msg.query,
+        user_id              = msg.user_id or "default",   # ← CRITICAL
+        dietary_restrictions = msg.dietary_restrictions or [],
+        health_conditions    = msg.health_conditions   or [],
+        calorie_limit        = msg.calorie_limit or 500,
+        budget_limit         = float(msg.budget_limit or 500),
+        servings             = msg.servings or 2,
+        cuisine_preference   = msg.cuisine_preference or "Indian",
+        extra_ingredients    = [],
+        conversation_history = [],
+    )
+    state["session_id"]   = msg.session_id or str(uuid.uuid4())[:8]
+    state["user_profile"] = svc["profile_db"].get_full_profile()
+    return state, svc
+
+
+# ── System endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/", response_model=APIResponse, tags=["System"])
 async def root():
-    """Health check endpoint"""
     return APIResponse(
-        success=True,
-        message="NutriBot API is running",
-        data={
-            "version": "5.0.0",
-            "status": "healthy",
-            "groq_available": bool(services.get("client")),
-        }
+        success=True, message="NutriBot API v6.0",
+        data={"version": "6.0.0", "groq_available": bool(_global_client)}
     )
 
 
 @app.get("/health", tags=["System"])
 async def health_check():
-    """Detailed health check"""
-    return {
-        "status": "healthy",
-        "services": {
-            "groq": bool(services.get("client")),
-            "database": bool(services.get("db")),
-            "profile_db": bool(services.get("profile_db")),
-        }
-    }
+    return {"status": "healthy", "groq": bool(_global_client)}
 
 
-# ============================================================================
-# Chat/Conversation Endpoints
-# ============================================================================
+# ── Chat ──────────────────────────────────────────────────────────────────────
 
 @app.post("/chat", response_model=APIResponse, tags=["Chat"])
 async def chat(message: UserMessage):
-    """
-    Send a message to NutriBot and get a response.
-    
-    Supports:
-    - Recipe generation
-    - Pantry management
-    - Nutrition tracking
-    - Meal planning
-    - Health advice
-    - Budget analysis
-    """
     from agents.streaming_pipeline import run_streaming_pipeline
-    from agents.workflow import build_initial_state
-    
-    session_id = get_session_id(message.user_id, message.session_id)
-    
-    # Build initial state
-    state = build_initial_state(
-        user_query=message.query,
-        dietary_restrictions=message.dietary_restrictions or [],
-        health_conditions=message.health_conditions or [],
-        calorie_limit=message.calorie_limit or 500,
-        budget_limit=message.budget_limit or 500.0,
-        servings=message.servings or 2,
-        cuisine_preference=message.cuisine_preference or "Indian",
-        extra_ingredients=[],
-        conversation_history=[],
-    )
-    state["session_id"] = session_id
-    state["user_id"] = message.user_id
-    state["input_mode"] = message.input_mode
-    
-    # Run pipeline (non-streaming for API)
-    final_state = None
-    assistant_message = ""
-    intent = "general"
-    nutrition_data = None
-    budget_data = None
-    eco_data = None
-    generated_recipe = None
-    
+
+    state, svc = _get_state(message)
+    final_state = state
+
     for event in run_streaming_pipeline(
-        state,
-        services["client"],
-        services["db"],
-        services["recipe_kb"],
-        profile_db=services["profile_db"],
-        feedback_db=services["feedback_db"],
+        state, _global_client,
+        svc["db"], _global_recipe_kb,
+        profile_db  = svc["profile_db"],
+        feedback_db = svc["feedback_db"],
     ):
         if event.get("type") == "complete":
-            final_state = event.get("state", {})
-    
-    if final_state:
-        assistant_message = (
-            final_state.get("assistant_message") or
-            final_state.get("generated_recipe") or
-            "I processed your request."
-        )
-        intent = final_state.get("intent", "general")
-        nutrition_data = final_state.get("nutrition_data")
-        budget_data = final_state.get("budget_analysis")
-        eco_data = final_state.get("eco_score")
-        generated_recipe = final_state.get("generated_recipe")
-    
+            final_state = event.get("state", state)
+
+    intent       = final_state.get("intent", "general")
+    message_text = (
+        final_state.get("assistant_message") or
+        final_state.get("generated_recipe")  or
+        "Request processed."
+    )
+
     return APIResponse(
-        success=True,
-        message="Chat processed successfully",
+        success=True, message="OK",
         data={
-            "response": assistant_message,
-            "intent": intent,
-            "session_id": session_id,
-            "nutrition": nutrition_data,
-            "budget": budget_data,
-            "eco": eco_data,
-            "generated_recipe": generated_recipe,
+            "response":         message_text,
+            "intent":           intent,
+            "session_id":       final_state.get("session_id"),
+            "nutrition":        final_state.get("nutrition_data"),
+            "budget":           final_state.get("budget_analysis"),
+            "eco":              final_state.get("eco_score"),
+            "generated_recipe": final_state.get("generated_recipe"),
         }
     )
 
 
 @app.post("/chat/stream", tags=["Chat"])
 async def chat_stream(message: UserMessage):
-    """
-    Stream chat response as Server-Sent Events.
-    Use this for real-time responses in Android app.
-    """
     from agents.streaming_pipeline import run_streaming_pipeline
-    from agents.workflow import build_initial_state
-    
+
     async def generate():
-        session_id = get_session_id(message.user_id, message.session_id)
-        
-        state = build_initial_state(
-            user_query=message.query,
-            dietary_restrictions=message.dietary_restrictions or [],
-            health_conditions=message.health_conditions or [],
-            calorie_limit=message.calorie_limit or 500,
-            budget_limit=message.budget_limit or 500.0,
-            servings=message.servings or 2,
-            cuisine_preference=message.cuisine_preference or "Indian",
-            extra_ingredients=[],
-            conversation_history=[],
-        )
-        state["session_id"] = session_id
-        state["user_id"] = message.user_id
-        
+        state, svc = _get_state(message)
         for event in run_streaming_pipeline(
-            state,
-            services["client"],
-            services["db"],
-            services["recipe_kb"],
-            profile_db=services["profile_db"],
-            feedback_db=services["feedback_db"],
+            state, _global_client,
+            svc["db"], _global_recipe_kb,
+            profile_db  = svc["profile_db"],
+            feedback_db = svc["feedback_db"],
         ):
-            import json
             yield f"data: {json.dumps(event)}\n\n"
-        
         yield "data: [DONE]\n\n"
-    
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
-    )
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control":"no-cache","Connection":"keep-alive"})
 
 
-# ============================================================================
-# User Profile Endpoints
-# ============================================================================
+# ── Profile endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/profile/{user_id}", response_model=APIResponse, tags=["Profile"])
 async def get_profile(user_id: str):
-    """Get user profile"""
-    profile = services["profile_db"].get_full_profile()
-    
-    # Add user_id to profile
+    svc     = _get_svc(user_id)
+    profile = svc["profile_db"].get_full_profile()
     profile["user_id"] = user_id
-    
-    return APIResponse(
-        success=True,
-        message="Profile retrieved",
-        data=profile
-    )
+    return APIResponse(success=True, message="Profile retrieved", data=profile)
 
 
 @app.put("/profile/{user_id}", response_model=APIResponse, tags=["Profile"])
 async def update_profile(user_id: str, profile_update: UserProfileUpdate):
-    """Update user profile"""
-    profile_db = services["profile_db"]
-    
-    # Update each field
-    update_dict = profile_update.model_dump(exclude_none=True)
-    for key, value in update_dict.items():
-        profile_db.set(key, value)
-    
-    # Get updated profile
-    updated_profile = profile_db.get_full_profile()
-    updated_profile["user_id"] = user_id
-    
-    return APIResponse(
-        success=True,
-        message="Profile updated successfully",
-        data=updated_profile
-    )
+    svc = _get_svc(user_id)
+    for key, value in profile_update.model_dump(exclude_none=True).items():
+        svc["profile_db"].set(key, value)
+    updated = svc["profile_db"].get_full_profile()
+    updated["user_id"] = user_id
+    return APIResponse(success=True, message="Profile updated", data=updated)
 
 
 @app.delete("/profile/{user_id}", response_model=APIResponse, tags=["Profile"])
 async def reset_profile(user_id: str):
-    """Reset user profile"""
-    services["profile_db"].clear()
-    
-    return APIResponse(
-        success=True,
-        message="Profile reset successfully",
-        data={"user_id": user_id}
-    )
+    from services.user_services import evict_user_cache
+    svc = _get_svc(user_id)
+    svc["profile_db"].clear()
+    evict_user_cache(user_id)
+    return APIResponse(success=True, message="Profile reset", data={"user_id": user_id})
 
 
-# ============================================================================
-# Pantry/Grocery Endpoints
-# ============================================================================
+# ── Pantry endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/pantry", response_model=APIResponse, tags=["Pantry"])
-async def get_pantry(user_id: Optional[str] = None):
-    """Get all pantry items"""
-    groceries = services["db"].get_all_groceries()
-    
-    return APIResponse(
-        success=True,
-        message="Pantry retrieved",
-        data={
-            "items": groceries,
-            "count": len(groceries),
-            "expiring_soon": services["db"].get_expiring_soon(3)
-        }
-    )
+async def get_pantry(user_id: str = Query("default")):
+    svc   = _get_svc(user_id)
+    items = svc["db"].get_all_groceries()
+    return APIResponse(success=True, message="Pantry retrieved",
+                       data={"items": items, "count": len(items),
+                             "expiring_soon": svc["db"].get_expiring_soon(3)})
 
 
 @app.post("/pantry", response_model=APIResponse, tags=["Pantry"])
-async def add_to_pantry(item: GroceryItemAdd):
-    """Add item to pantry"""
-    success = services["db"].add_grocery(
-        item_name=item.item_name,
-        quantity=item.quantity,
-        unit=item.unit,
-        category=item.category,
-        is_perishable=item.is_perishable,
-        days_until_expiry=item.days_until_expiry,
+async def add_to_pantry(item: GroceryItemAdd, user_id: str = Query("default")):
+    svc = _get_svc(user_id)
+    ok  = svc["db"].add_grocery(
+        item_name         = item.item_name,
+        quantity          = item.quantity,
+        unit              = item.unit,
+        category          = item.category,
+        is_perishable     = item.is_perishable,
+        days_until_expiry = item.days_until_expiry,
     )
-    
-    if success:
-        return APIResponse(
-            success=True,
-            message=f"Added {item.quantity} {item.unit} {item.item_name} to pantry",
-            data={"item": item.model_dump()}
-        )
-    else:
-        return APIResponse(
-            success=False,
-            message="Failed to add item",
-            error="Database error"
-        )
+    if ok:
+        return APIResponse(success=True, message=f"Added {item.item_name}", data=item.model_dump())
+    return APIResponse(success=False, message="Failed", error="DB error")
 
 
 @app.delete("/pantry", response_model=APIResponse, tags=["Pantry"])
-async def remove_from_pantry(item: GroceryItemRemove):
-    """Remove item from pantry"""
-    success = services["db"].delete_grocery(item.item_name)
-    
-    if success:
-        return APIResponse(
-            success=True,
-            message=f"Removed {item.item_name} from pantry",
-            data={"removed_item": item.item_name}
-        )
-    else:
-        return APIResponse(
-            success=False,
-            message=f"Item {item.item_name} not found in pantry",
-            error="Not found"
-        )
+async def remove_from_pantry(item: GroceryItemRemove, user_id: str = Query("default")):
+    svc = _get_svc(user_id)
+    ok  = svc["db"].delete_grocery(item.item_name)
+    if ok:
+        return APIResponse(success=True, message=f"Removed {item.item_name}", data={"removed": item.item_name})
+    return APIResponse(success=False, message=f"{item.item_name} not found", error="Not found")
 
 
 @app.delete("/pantry/all", response_model=APIResponse, tags=["Pantry"])
-async def clear_pantry():
-    """Clear all pantry items"""
-    services["db"].clear_inventory()
-    
-    return APIResponse(
-        success=True,
-        message="Pantry cleared successfully",
-        data={}
-    )
+async def clear_pantry(user_id: str = Query("default")):
+    svc = _get_svc(user_id)
+    svc["db"].clear_inventory()
+    return APIResponse(success=True, message="Pantry cleared", data={})
 
 
 @app.get("/pantry/expiring", response_model=APIResponse, tags=["Pantry"])
-async def get_expiring_items(days: int = 3):
-    """Get items expiring within days"""
-    expiring = services["db"].get_expiring_soon(days)
-    
-    return APIResponse(
-        success=True,
-        message=f"Items expiring within {days} days",
-        data={
-            "items": expiring,
-            "count": len(expiring),
-            "days": days
-        }
-    )
+async def get_expiring(user_id: str = Query("default"), days: int = 3):
+    svc      = _get_svc(user_id)
+    expiring = svc["db"].get_expiring_soon(days)
+    return APIResponse(success=True, message=f"Expiring in {days} days",
+                       data={"items": expiring, "count": len(expiring)})
 
 
-# ============================================================================
-# Recipe Endpoints
-# ============================================================================
+# ── Recipe endpoints ──────────────────────────────────────────────────────────
 
 @app.post("/recipe/generate", response_model=APIResponse, tags=["Recipes"])
 async def generate_recipe(message: UserMessage):
-    """
-    Generate a recipe based on user query and preferences.
-    """
     from agents.receipe_agent import RecipeAgent
-    
-    # Build state
-    from agents.workflow import build_initial_state
-    state = build_initial_state(
-        user_query=message.query,
-        dietary_restrictions=message.dietary_restrictions or [],
-        health_conditions=message.health_conditions or [],
-        calorie_limit=message.calorie_limit or 500,
-        budget_limit=message.budget_limit or 500.0,
-        servings=message.servings or 2,
-        cuisine_preference=message.cuisine_preference or "Indian",
-        extra_ingredients=[],
-        conversation_history=[],
-    )
-    
-    # Add pantry items
-    state["available_ingredients"] = [
-        g["item_name"] for g in services["db"].get_all_groceries()
-    ]
-    
-    # Generate recipe
-    recipe_agent = RecipeAgent()
-    state = recipe_agent.run(state, client=services["client"])
-    
-    return APIResponse(
-        success=True,
-        message="Recipe generated",
-        data={
-            "recipe": state.get("generated_recipe", ""),
-            "ingredients": state.get("recipe_ingredients_structured", []),
-            "nutrition": state.get("nutrition_data"),
-            "budget": state.get("budget_analysis"),
-            "eco_score": state.get("eco_score"),
-        }
-    )
+
+    state, svc = _get_state(message)
+    state["available_ingredients"] = [g["item_name"] for g in svc["db"].get_all_groceries()]
+
+    state = RecipeAgent().run(state, client=_global_client)
+    return APIResponse(success=True, message="Recipe generated",
+                       data={
+                           "recipe":      state.get("generated_recipe", ""),
+                           "ingredients": state.get("recipe_ingredients_structured", []),
+                           "nutrition":   state.get("nutrition_data"),
+                           "budget":      state.get("budget_analysis"),
+                           "eco_score":   state.get("eco_score"),
+                       })
 
 
 @app.post("/recipe/rate", response_model=APIResponse, tags=["Recipes"])
-async def rate_recipe(rating: RecipeRating):
-    """Rate a recipe and provide feedback"""
-    recipe_id = services["feedback_db"].save_rating(
-        recipe_name=rating.recipe_name,
-        rating=rating.rating,
-        recipe_content=rating.recipe_content or "",
-        feedback_text=rating.feedback or "",
-        cuisine=rating.cuisine or "",
+async def rate_recipe(rating: RecipeRating, user_id: str = Query("default")):
+    svc = _get_svc(user_id)
+    rid = svc["feedback_db"].save_rating(
+        recipe_name    = rating.recipe_name,
+        rating         = rating.rating,
+        recipe_content = rating.recipe_content or "",
+        feedback_text  = rating.feedback or "",
+        cuisine        = rating.cuisine or "",
     )
-    
-    return APIResponse(
-        success=True,
-        message=f"Recipe rated {rating.rating}/5 stars",
-        data={
-            "recipe_name": rating.recipe_name,
-            "rating": rating.rating,
-            "recipe_id": recipe_id
-        }
-    )
+    return APIResponse(success=True, message=f"Rated {rating.rating}/5",
+                       data={"recipe_name": rating.recipe_name, "rating": rating.rating, "id": rid})
 
 
-# ============================================================================
-# Meal Plan Endpoints
-# ============================================================================
+# ── Meal plan endpoints ───────────────────────────────────────────────────────
 
 @app.get("/mealplan", response_model=APIResponse, tags=["Meal Plans"])
-async def get_meal_plans(days: int = 7):
-    """Get meal plans for the last N days"""
-    meals = services["db"].get_meal_plans(days)
-    
-    return APIResponse(
-        success=True,
-        message=f"Retrieved {len(meals)} meal plans",
-        data={
-            "meals": meals,
-            "count": len(meals),
-            "days": days
-        }
-    )
+async def get_meal_plans(user_id: str = Query("default"), days: int = 7):
+    svc   = _get_svc(user_id)
+    meals = svc["db"].get_meal_plans(days)
+    return APIResponse(success=True, message=f"{len(meals)} meals",
+                       data={"meals": meals, "count": len(meals)})
 
 
 @app.get("/mealplan/today", response_model=APIResponse, tags=["Meal Plans"])
-async def get_today_meal_plans():
-    """Get today's meal plans"""
-    meals = services["db"].get_meal_plans_today()
-    
-    # Group by meal type
-    grouped = {}
-    for meal in meals:
-        meal_type = meal.get("meal_type", "other")
-        if meal_type not in grouped:
-            grouped[meal_type] = []
-        grouped[meal_type].append(meal)
-    
-    return APIResponse(
-        success=True,
-        message="Today's meal plans retrieved",
-        data={
-            "meals": meals,
-            "grouped": grouped,
-            "count": len(meals),
-            "date": date.today().isoformat()
-        }
-    )
+async def get_today_meals(user_id: str = Query("default")):
+    svc   = _get_svc(user_id)
+    meals = svc["db"].get_meal_plans_today()
+    grouped: Dict[str, list] = {}
+    for m in meals:
+        grouped.setdefault(m.get("meal_type", "other"), []).append(m)
+    return APIResponse(success=True, message="Today's meals",
+                       data={"meals": meals, "grouped": grouped, "date": date.today().isoformat()})
 
 
 @app.post("/mealplan", response_model=APIResponse, tags=["Meal Plans"])
-async def save_meal_plan(meal: MealPlanSave):
-    """Save a meal plan entry"""
-    services["db"].save_meal_plan(
-        plan_date=meal.plan_date,
-        meal_type=meal.meal_type,
-        recipe_name=meal.recipe_name,
-        calories=meal.calories,
-        protein_g=meal.protein_g,
-        carbs_g=meal.carbs_g,
-        fat_g=meal.fat_g,
-        notes=meal.notes or "",
+async def save_meal_plan(meal: MealPlanSave, user_id: str = Query("default")):
+    svc = _get_svc(user_id)
+    ok  = svc["db"].save_meal_plan(
+        plan_date   = meal.plan_date,
+        meal_type   = meal.meal_type,
+        recipe_name = meal.recipe_name,
+        calories    = meal.calories,
+        protein_g   = meal.protein_g,
+        carbs_g     = meal.carbs_g,
+        fat_g       = meal.fat_g,
+        notes       = meal.notes or "",
     )
-    
-    return APIResponse(
-        success=True,
-        message=f"Saved {meal.meal_type} meal for {meal.plan_date}",
-        data=meal.model_dump()
-    )
+    if ok:
+        return APIResponse(success=True, message=f"Saved {meal.meal_type}", data=meal.model_dump())
+    return APIResponse(success=False, message="Failed to save", error="DB error")
 
 
 @app.post("/mealplan/week", response_model=APIResponse, tags=["Meal Plans"])
-async def generate_weekly_plan(message: UserMessage):
-    """Generate a weekly meal plan"""
+async def weekly_plan(req: WeeklyPlanRequest):
     from agents.planner_agent import meal_plan_agent
     from agents.workflow import build_initial_state
-    
-    state = build_initial_state(
-        user_query=message.query,
-        dietary_restrictions=message.dietary_restrictions or [],
-        health_conditions=message.health_conditions or [],
-        calorie_limit=message.calorie_limit or 500,
-        budget_limit=message.budget_limit or 500.0,
-        servings=message.servings or 2,
-        cuisine_preference=message.cuisine_preference or "Indian",
-        extra_ingredients=[],
-        conversation_history=[],
-    )
-    
-    state["user_profile"] = services["profile_db"].get_full_profile()
-    
-    state = meal_plan_agent(state, client=services["client"], db=services["db"])
-    
-    return APIResponse(
-        success=True,
-        message="Weekly meal plan generated",
-        data={
-            "plan": state.get("assistant_message", ""),
-        }
-    )
+
+    uid   = req.user_id or "default"
+    svc   = _get_svc(uid)
+    state = build_initial_state(user_query=req.query, user_id=uid)
+    state["user_profile"] = svc["profile_db"].get_full_profile()
+    state = meal_plan_agent(state, client=_global_client, db=svc["db"])
+    return APIResponse(success=True, message="Weekly plan generated",
+                       data={"plan": state.get("assistant_message","")})
 
 
-# ============================================================================
-# Nutrition Tracking Endpoints
-# ============================================================================
+# ── Nutrition endpoints ───────────────────────────────────────────────────────
 
 @app.get("/nutrition/today", response_model=APIResponse, tags=["Nutrition"])
-async def get_today_nutrition():
-    """Get today's nutrition summary"""
+async def today_nutrition(user_id: str = Query("default")):
     from agents.nutrition_tracker import get_daily_nutrition_summary
-    
-    # Create dummy state
     from agents.workflow import build_initial_state
-    state = build_initial_state(user_query="")
-    state["user_profile"] = services["profile_db"].get_full_profile()
-    
-    state = get_daily_nutrition_summary(state, services["db"], services["client"])
-    
-    return APIResponse(
-        success=True,
-        message="Today's nutrition summary",
-        data={
-            "summary": state.get("daily_nutrition_summary", {}),
-            "message": state.get("assistant_message", ""),
-            "date": date.today().isoformat()
-        }
-    )
+
+    svc   = _get_svc(user_id)
+    state = build_initial_state(user_query="", user_id=user_id)
+    state["user_profile"] = svc["profile_db"].get_full_profile()
+    state = get_daily_nutrition_summary(state, svc["db"], _global_client)
+    return APIResponse(success=True, message="Today's nutrition",
+                       data={"summary": state.get("daily_nutrition_summary",{}),
+                             "message": state.get("assistant_message",""),
+                             "date":    date.today().isoformat()})
 
 
 @app.get("/nutrition/week", response_model=APIResponse, tags=["Nutrition"])
-async def get_weekly_nutrition():
-    """Get weekly nutrition summary"""
-    meals = services["db"].get_meal_plans(7)
-    
-    # Aggregate by day
-    daily_totals = {}
-    for meal in meals:
-        day = meal.get("plan_date", "")
-        if day not in daily_totals:
-            daily_totals[day] = {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0}
-        
-        daily_totals[day]["calories"] += meal.get("calories", 0)
-        daily_totals[day]["protein_g"] += meal.get("protein_g", 0)
-        daily_totals[day]["carbs_g"] += meal.get("carbs_g", 0)
-        daily_totals[day]["fat_g"] += meal.get("fat_g", 0)
-    
-    return APIResponse(
-        success=True,
-        message="Weekly nutrition summary",
-        data={
-            "daily_totals": daily_totals,
-            "meals": meals,
-            "total_calories": sum(m.get("calories", 0) for m in meals)
-        }
-    )
+async def weekly_nutrition(user_id: str = Query("default")):
+    svc   = _get_svc(user_id)
+    meals = svc["db"].get_meal_plans(7)
+    daily: Dict[str, dict] = {}
+    for m in meals:
+        day = m.get("plan_date","")
+        if day not in daily:
+            daily[day] = {"calories":0,"protein_g":0,"carbs_g":0,"fat_g":0}
+        daily[day]["calories"]  += m.get("calories", 0)
+        daily[day]["protein_g"] += m.get("protein_g",0)
+        daily[day]["carbs_g"]   += m.get("carbs_g",  0)
+        daily[day]["fat_g"]     += m.get("fat_g",    0)
+    return APIResponse(success=True, message="Weekly nutrition",
+                       data={"daily_totals": daily, "meals": meals})
 
 
-# ============================================================================
-# Budget & Pricing Endpoints
-# ============================================================================
+# ── Budget endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/budget/cheapest-protein", response_model=APIResponse, tags=["Budget"])
-async def get_cheapest_protein(diet_type: str = "vegetarian"):
-    """Get cheapest protein source"""
-    cheapest = services["price_service"].get_cheapest_protein(diet_type)
-    
-    return APIResponse(
-        success=True,
-        message="Cheapest protein source found",
-        data=cheapest
-    )
+async def cheapest_protein(user_id: str = Query("default"), diet_type: str = "vegetarian"):
+    svc  = _get_svc(user_id)
+    data = svc["price_service"].get_cheapest_protein(diet_type)
+    return APIResponse(success=True, message="Cheapest protein", data=data)
 
 
 @app.get("/budget/prices", response_model=APIResponse, tags=["Budget"])
-async def get_all_prices():
-    """Get all ingredient prices"""
-    prices = services["price_service"].get_all_prices()
-    
-    return APIResponse(
-        success=True,
-        message="Retrieved all prices",
-        data={"prices": prices, "count": len(prices)}
-    )
+async def all_prices(user_id: str = Query("default")):
+    svc    = _get_svc(user_id)
+    prices = svc["price_service"].get_all_prices()
+    return APIResponse(success=True, message="All prices", data={"prices": prices})
 
 
 @app.get("/budget/price/{ingredient}", response_model=APIResponse, tags=["Budget"])
-async def get_ingredient_price(ingredient: str, quantity_kg: float = 1.0):
-    """Get price for a specific ingredient"""
-    price = services["price_service"].get_price(ingredient, quantity_kg)
-    
-    return APIResponse(
-        success=True,
-        message=f"Price for {ingredient}",
-        data={
-            "ingredient": ingredient,
-            "price_inr": price,
-            "quantity_kg": quantity_kg
-        }
-    )
+async def ingredient_price(ingredient: str, user_id: str = Query("default"), quantity_kg: float = 1.0):
+    svc   = _get_svc(user_id)
+    price = svc["price_service"].get_price(ingredient, quantity_kg)
+    return APIResponse(success=True, message=f"Price for {ingredient}",
+                       data={"ingredient": ingredient, "price_inr": price})
 
 
-@app.post("/budget/price", response_model=APIResponse, tags=["Budget"])
-async def update_ingredient_price(ingredient: str, price: float, source: str = "api"):
-    """Update ingredient price"""
-    services["price_service"].update_price(ingredient, price, source)
-    
-    return APIResponse(
-        success=True,
-        message=f"Updated price for {ingredient} to ₹{price}",
-        data={"ingredient": ingredient, "price": price}
-    )
-
-
-# ============================================================================
-# Image/Vision Endpoints
-# ============================================================================
-
-@app.post("/vision/analyze", response_model=APIResponse, tags=["Vision"])
-async def analyze_image(
-    file: UploadFile = File(...),
-    context: str = Form("fridge"),
-    user_id: Optional[str] = Form(None)
-):
-    """Analyze food image and detect ingredients"""
-    from vision.vision_agent import analyse_food_image, image_to_inventory
-    
-    # Read image bytes
-    image_bytes = await file.read()
-    
-    # Analyze image
-    if services["client"]:
-        result = analyse_food_image(image_bytes, services["client"], context)
-    else:
-        from vision.vision_agent import analyse_food_image_anthropic
-        result = analyse_food_image_anthropic(image_bytes, context)
-    
-    # Optionally add to inventory
-    if result.get("detected_items") and user_id:
-        summary = image_to_inventory(image_bytes, services["db"], services["client"], context)
-        result["inventory_summary"] = summary[1]
-    
-    return APIResponse(
-        success=True,
-        message="Image analyzed",
-        data=result
-    )
-
-
-# ============================================================================
-# Voice Endpoints
-# ============================================================================
-
-@app.post("/voice/transcribe", response_model=APIResponse, tags=["Voice"])
-async def transcribe_audio(
-    file: UploadFile = File(...),
-    language: str = Form("en")
-):
-    """Transcribe audio to text using Groq Whisper"""
-    from voice.voice_agent import transcribe_audio_groq
-    
-    audio_bytes = await file.read()
-    text = transcribe_audio_groq(audio_bytes, services["client"], file.filename)
-    
-    return APIResponse(
-        success=True,
-        message="Audio transcribed",
-        data={
-            "text": text,
-            "language": language
-        }
-    )
-
-
-# ============================================================================
-# Shopping List Endpoints
-# ============================================================================
+# ── Shopping endpoints ────────────────────────────────────────────────────────
 
 @app.post("/shopping/generate", response_model=APIResponse, tags=["Shopping"])
-async def generate_shopping_list(message: UserMessage):
-    """Generate shopping list based on user request"""
+async def shopping_list(req: ShoppingListRequest):
     from agents.shopping_agent import shopping_agent
     from agents.workflow import build_initial_state
-    
-    state = build_initial_state(
-        user_query=message.query,
-        dietary_restrictions=message.dietary_restrictions or [],
-        health_conditions=message.health_conditions or [],
-        calorie_limit=message.calorie_limit or 500,
-        budget_limit=message.budget_limit or 500.0,
-        servings=message.servings or 2,
-        cuisine_preference=message.cuisine_preference or "Indian",
-        extra_ingredients=[],
-        conversation_history=[],
-    )
-    
-    state["user_profile"] = services["profile_db"].get_full_profile()
-    state["recipe_ingredients_structured"] = []
-    
-    state = shopping_agent(state, db=services["db"], client=services["client"])
-    
-    return APIResponse(
-        success=True,
-        message="Shopping list generated",
-        data={
-            "shopping_list": state.get("assistant_message", ""),
-        }
-    )
+
+    uid   = req.user_id or "default"
+    svc   = _get_svc(uid)
+    state = build_initial_state(user_query=req.query, user_id=uid)
+    state["user_profile"] = svc["profile_db"].get_full_profile()
+    state = shopping_agent(state, db=svc["db"], client=_global_client)
+    return APIResponse(success=True, message="Shopping list",
+                       data={"shopping_list": state.get("assistant_message","")})
 
 
-# ============================================================================
-# Cooking Mode Endpoints
-# ============================================================================
+# ── Cooking mode endpoints ────────────────────────────────────────────────────
 
 @app.post("/cooking/parse", response_model=APIResponse, tags=["Cooking"])
-async def parse_recipe_steps(recipe_text: str):
-    """Parse recipe into step-by-step instructions"""
+async def parse_steps(req: ParseStepsRequest):
     from agents.cooking_agent import CookingAgent
-    
-    cooking_agent = CookingAgent()
-    steps = cooking_agent.parse_recipe_steps(recipe_text)
-    
-    return APIResponse(
-        success=True,
-        message=f"Parsed {len(steps)} steps",
-        data={
-            "steps": steps,
-            "total_steps": len(steps)
-        }
-    )
+    steps = CookingAgent().parse_recipe_steps(req.recipe_text)
+    return APIResponse(success=True, message=f"{len(steps)} steps",
+                       data={"steps": steps, "total_steps": len(steps)})
 
 
-@app.get("/cooking/step/{recipe_id}/{step_index}", response_model=APIResponse, tags=["Cooking"])
-async def get_cooking_step(recipe_id: str, step_index: int):
-    """Get a specific cooking step"""
-    # Store recipes in session or database
-    # For now, return error if no recipe found
-    return APIResponse(
-        success=False,
-        message="Recipe not found in session",
-        error="No recipe stored for this session"
-    )
-
-
-# ============================================================================
-# Eco Score Endpoints
-# ============================================================================
-
-@app.post("/eco/calculate", response_model=APIResponse, tags=["Eco"])
-async def calculate_eco_score(ingredients: List[Dict[str, Any]]):
-    """Calculate eco score for ingredients"""
-    from agents.eco_agent import eco_agent
-    from agents.workflow import build_initial_state
-    
-    state = build_initial_state(user_query="")
-    state["recipe_ingredients_structured"] = ingredients
-    state["user_profile"] = services["profile_db"].get_full_profile()
-    
-    state = eco_agent(state, db=services["db"])
-    
-    return APIResponse(
-        success=True,
-        message="Eco score calculated",
-        data=state.get("eco_score", {})
-    )
-
-
-# ============================================================================
-# Health Advice Endpoints
-# ============================================================================
+# ── Health advice endpoint ────────────────────────────────────────────────────
 
 @app.post("/health/advice", response_model=APIResponse, tags=["Health"])
-async def get_health_advice(message: UserMessage):
-    """Get personalized health advice"""
+async def health_advice(req: HealthAdviceRequest):
     from agents.health_agent import health_agent
     from agents.workflow import build_initial_state
-    
-    state = build_initial_state(
-        user_query=message.query,
-        dietary_restrictions=message.dietary_restrictions or [],
-        health_conditions=message.health_conditions or [],
-        calorie_limit=message.calorie_limit or 500,
-        budget_limit=message.budget_limit or 500.0,
-        servings=message.servings or 2,
-        cuisine_preference=message.cuisine_preference or "Indian",
-        extra_ingredients=[],
-        conversation_history=[],
-    )
-    
-    state["user_profile"] = services["profile_db"].get_full_profile()
-    state["intent"] = "health_advice"
-    
-    state = health_agent(state, client=services["client"])
-    
-    return APIResponse(
-        success=True,
-        message="Health advice generated",
-        data={
-            "advice": state.get("assistant_message", ""),
-            "recommendations": state.get("health_recommendations", "")
-        }
-    )
+
+    uid   = req.user_id or "default"
+    svc   = _get_svc(uid)
+    state = build_initial_state(user_query=req.query, user_id=uid)
+    state["user_profile"] = svc["profile_db"].get_full_profile()
+    state["intent"]       = "health_advice"
+    state = health_agent(state, client=_global_client)
+    return APIResponse(success=True, message="Health advice",
+                       data={"advice":          state.get("assistant_message",""),
+                             "recommendations": state.get("health_recommendations","")})
 
 
-# ============================================================================
-# Feedback & Analytics Endpoints
-# ============================================================================
+# ── Eco score endpoint ────────────────────────────────────────────────────────
+
+@app.post("/eco/calculate", response_model=APIResponse, tags=["Eco"])
+async def eco_score(req: EcoScoreRequest, user_id: str = Query("default")):
+    from agents.eco_agent import eco_agent
+    from agents.workflow import build_initial_state
+
+    svc   = _get_svc(user_id)
+    state = build_initial_state(user_query="", user_id=user_id)
+    state["recipe_ingredients_structured"] = req.ingredients
+    state["user_profile"] = svc["profile_db"].get_full_profile()
+    state = eco_agent(state, db=svc["db"])
+    return APIResponse(success=True, message="Eco score", data=state.get("eco_score",{}))
+
+
+# ── Feedback endpoints ────────────────────────────────────────────────────────
 
 @app.get("/feedback/stats", response_model=APIResponse, tags=["Feedback"])
-async def get_feedback_stats():
-    """Get feedback statistics"""
-    stats = services["feedback_db"].get_preference_summary()
-    
-    return APIResponse(
-        success=True,
-        message="Feedback statistics",
-        data=stats
-    )
+async def feedback_stats(user_id: str = Query("default")):
+    svc   = _get_svc(user_id)
+    stats = svc["feedback_db"].get_preference_summary()
+    return APIResponse(success=True, message="Feedback stats", data=stats)
 
 
 @app.get("/feedback/top-cuisines", response_model=APIResponse, tags=["Feedback"])
-async def get_top_cuisines(min_ratings: int = 1):
-    """Get top-rated cuisines"""
-    top = services["feedback_db"].get_top_cuisines(min_ratings)
-    
-    return APIResponse(
-        success=True,
-        message="Top cuisines retrieved",
-        data={"cuisines": top}
-    )
+async def top_cuisines(user_id: str = Query("default"), min_ratings: int = 1):
+    svc = _get_svc(user_id)
+    top = svc["feedback_db"].get_top_cuisines(min_ratings)
+    return APIResponse(success=True, message="Top cuisines", data={"cuisines": top})
 
 
 @app.get("/feedback/liked-ingredients", response_model=APIResponse, tags=["Feedback"])
-async def get_liked_ingredients(min_likes: int = 2):
-    """Get most liked ingredients"""
-    liked = services["feedback_db"].get_liked_ingredients(min_likes)
-    
-    return APIResponse(
-        success=True,
-        message="Liked ingredients retrieved",
-        data={"ingredients": liked}
-    )
+async def liked_ingredients(user_id: str = Query("default"), min_likes: int = 2):
+    svc   = _get_svc(user_id)
+    liked = svc["feedback_db"].get_liked_ingredients(min_likes)
+    return APIResponse(success=True, message="Liked ingredients", data={"ingredients": liked})
 
 
-# ============================================================================
-# Main Entry Point
-# ============================================================================
+# ── Vision endpoint ───────────────────────────────────────────────────────────
+
+@app.post("/vision/analyze", response_model=APIResponse, tags=["Vision"])
+async def analyze_image(
+    file:    UploadFile = File(...),
+    context: str        = Form("fridge"),
+    user_id: str        = Form("default"),
+):
+    from vision.vision_agent import image_to_inventory, preprocess_image
+
+    raw_bytes  = await file.read()
+    img_bytes, _ = preprocess_image(raw_bytes)
+    svc = _get_svc(user_id)
+
+    result, summary = image_to_inventory(img_bytes, svc["db"], _global_client, context)
+    result["inventory_summary"] = summary
+    return APIResponse(success=True, message="Image analyzed", data=result)
+
+
+# ── Voice endpoint ────────────────────────────────────────────────────────────
+
+@app.post("/voice/transcribe", response_model=APIResponse, tags=["Voice"])
+async def transcribe(file: UploadFile = File(...)):
+    from voice.voice_agent import transcribe_audio_groq
+    audio = await file.read()
+    text  = transcribe_audio_groq(audio, _global_client, file.filename)
+    return APIResponse(success=True, message="Transcribed", data={"text": text})
+
+
+# ── Admin ─────────────────────────────────────────────────────────────────────
+
+@app.get("/admin/users", tags=["Admin"])
+async def list_users():
+    from database.user_db_manager import list_all_users
+    return {"users": list_all_users()}
+
+
+@app.delete("/admin/users/{user_id}", tags=["Admin"])
+async def purge_user(user_id: str):
+    """
+    Delete all data for a user (GDPR / admin use only).
+    Removes their database files from disk.
+    """
+    from services.user_services import evict_user_cache
+    from database.user_db_manager import get_user_data_dir
+    import shutil
+
+    evict_user_cache(user_id)
+    user_dir = get_user_data_dir(user_id)
+    if os.path.exists(user_dir):
+        shutil.rmtree(user_dir)
+        return {"deleted": True, "user_id": user_id}
+    return {"deleted": False, "reason": "User directory not found"}
+
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")

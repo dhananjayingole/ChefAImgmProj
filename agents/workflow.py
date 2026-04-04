@@ -1,4 +1,4 @@
-"""agents/workflow.py — Simplified LangGraph workflow."""
+"""agents/workflow.py — Multi-user LangGraph workflow with user_id threading."""
 
 import functools
 from langgraph.graph import StateGraph, END
@@ -14,13 +14,26 @@ from agents.user_profile import UserProfileDB
 def route_by_intent(state: AgentState) -> str:
     intent = state.get("intent", "general")
     routes = {
-        "generate_recipe": "recipe_agent",
-        "modify_recipe": "recipe_agent",
-        "view_inventory": "pantry_agent",
-        "add_inventory": "pantry_agent",
-        "remove_inventory": "pantry_agent",
-        "general": "end",
-        "greeting": "end",
+        "generate_recipe":       "recipe_agent",
+        "modify_recipe":         "recipe_agent",
+        "view_inventory":        "pantry_agent",
+        "add_inventory":         "pantry_agent",
+        "remove_inventory":      "pantry_agent",
+        "remove_all_inventory":  "pantry_agent",
+        "general":               "end",
+        "greeting":              "end",
+        "memory_recall":         "end",
+        "health_advice":         "end",
+        "meal_plan":             "end",
+        "shopping_list":         "end",
+        "daily_nutrition":       "end",
+        "save_meal":             "end",
+        "view_calendar":         "end",
+        "rate_recipe":           "end",
+        "eco_tips":              "end",
+        "budget_analysis":       "end",
+        "cooking_tips":          "end",
+        "start_cooking_mode":    "end",
     }
     return routes.get(intent, "end")
 
@@ -60,6 +73,7 @@ def create_workflow(client, db, recipe_kb, profile_db: UserProfileDB = None, fee
 
 def build_initial_state(
     user_query: str,
+    user_id: str = "default",            # ← MULTI-USER: always pass this
     dietary_restrictions: list = None,
     health_conditions: list = None,
     calorie_limit: int = 600,
@@ -69,36 +83,46 @@ def build_initial_state(
     extra_ingredients: list = None,
     conversation_history: list = None,
 ) -> AgentState:
-    return AgentState(
-        user_query=user_query,
-        available_ingredients=extra_ingredients or [],
-        dietary_restrictions=dietary_restrictions or [],
-        health_conditions=health_conditions or [],
-        calorie_limit=calorie_limit,
-        budget_limit=budget_limit,
-        servings=servings,
-        cuisine_preference=cuisine_preference,
-        conversation_history=conversation_history or [],
-        conversation_summary="",
-        user_profile={},
-        intent="general",
-        intent_confidence=0.0,
-        needs_clarification=False,
-        clarification_question="",
-        ingredient_analysis="",
-        health_recommendations="",
-        rag_results="",
-        generated_recipe="",
-        recipe_ingredients_structured=[],
-        budget_analysis={},
-        waste_score={},
-        shopping_list="",
-        nutrition_data={},
-        total_nutrition={},
-        final_output="",
-        assistant_message="",
-        errors=[],
-        agent_logs=[],
-        processing_time={},
-        retry_count=0,
+    """
+    Build the initial AgentState for a pipeline run.
+    user_id is propagated into state so every agent and the streaming
+    pipeline can resolve the correct per-user databases.
+    """
+    state = AgentState(
+        user_query           = user_query,
+        available_ingredients= extra_ingredients or [],
+        dietary_restrictions = dietary_restrictions or [],
+        health_conditions    = health_conditions or [],
+        calorie_limit        = calorie_limit,
+        budget_limit         = budget_limit,
+        servings             = servings,
+        cuisine_preference   = cuisine_preference,
+        conversation_history = conversation_history or [],
+        conversation_summary = "",
+        user_profile         = {},
+        intent               = "general",
+        intent_confidence    = 0.0,
+        needs_clarification  = False,
+        clarification_question = "",
+        ingredient_analysis  = "",
+        health_recommendations = "",
+        rag_results          = "",
+        generated_recipe     = "",
+        recipe_ingredients_structured = [],
+        budget_analysis      = {},
+        waste_score          = {},
+        shopping_list        = "",
+        nutrition_data       = {},
+        total_nutrition      = {},
+        final_output         = "",
+        assistant_message    = "",
+        errors               = [],
+        agent_logs           = [],
+        processing_time      = {},
+        retry_count          = 0,
     )
+
+    # ── CRITICAL: store user_id in state so the pipeline can use it ───────
+    state["user_id"] = user_id
+
+    return state

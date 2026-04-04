@@ -1,4 +1,7 @@
-"""agents/user_profile.py — Persistent user profile with incremental learning."""
+"""
+agents/user_profile.py — Per-user persistent profile with incremental learning.
+Each user_id gets their own profile.db under data/users/<user_id>/
+"""
 
 import json
 import sqlite3
@@ -6,15 +9,20 @@ import os
 import re
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-from agents.state import AgentState  # Add this import
 
-# Rest of your existing code...
+from database.user_db_manager import get_user_connection
+
 
 class UserProfileDB:
-    def __init__(self, db_path: str = "data/user_profile.db"):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+    """Per-user profile store. Pass user_id for full isolation."""
+
+    def __init__(self, user_id: str = "default", db_path: str = None):
+        self.user_id = user_id
+        if db_path:
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        else:
+            self.conn = get_user_connection(user_id, "user_profile.db")
         self._init_tables()
 
     def _init_tables(self):
@@ -81,51 +89,42 @@ class UserProfileDB:
         self.conn.execute("DELETE FROM user_profile")
         self.conn.commit()
 
+    def close(self):
+        pass
+
+
+# ── Regex fast-pass ──────────────────────────────────────────────────────────
 
 def _regex_extract_profile(message: str) -> Dict[str, Any]:
-    """Fast regex extraction of common profile statements."""
     updates: Dict[str, Any] = {}
     m = message.lower().strip()
 
-    # Diet type
     if re.search(r"\bi'?m\s+(a\s+)?vegan\b|i\s+eat\s+vegan|vegan\s+diet|strictly\s+vegan", m):
         updates["diet_type"] = "vegan"
     elif re.search(r"\bi'?m\s+(a\s+)?vegetarian\b|i\s+eat\s+vegetarian|vegetarian\s+diet|no\s+meat", m):
         updates["diet_type"] = "vegetarian"
     elif re.search(r"\bi'?m\s+(on\s+)?keto\b|keto\s+diet|ketogenic", m):
         updates["diet_type"] = "keto"
-    elif re.search(r"\bi'?m\s+(on\s+)?paleo\b|paleo\s+diet", m):
-        updates["diet_type"] = "paleo"
-    elif re.search(r"\bpescatarian\b", m):
-        updates["diet_type"] = "pescatarian"
     elif re.search(r"\bnon[\s-]?veg(etarian)?\b|i\s+eat\s+meat|i\s+eat\s+non[\s-]?veg", m):
         updates["diet_type"] = "non-vegetarian"
 
-    # Fitness goal
     if re.search(r"(goal|trying|want)\s+(is\s+)?(to\s+)?(lose|losing)\s+weight|weight\s+loss", m):
         updates["fitness_goal"] = "weight_loss"
-    elif re.search(r"(goal|trying|want)\s+(is\s+)?(to\s+)?(build|gain|grow)\s+muscle|muscle\s+gain|bulking", m):
+    elif re.search(r"(build|gain|grow)\s+muscle|muscle\s+gain|bulking", m):
         updates["fitness_goal"] = "muscle_gain"
-    elif re.search(r"(goal|trying|want)\s+(is\s+)?maintenance|maintain\s+(my\s+)?weight", m):
-        updates["fitness_goal"] = "maintenance"
 
-    # Cuisine preference
     cuisine_map = {
         "indian": "Indian", "italian": "Italian", "chinese": "Chinese",
         "mexican": "Mexican", "mediterranean": "Mediterranean",
-        "american": "American", "thai": "Thai", "japanese": "Japanese",
-        "middle eastern": "Middle Eastern", "korean": "Korean",
-        "french": "French", "greek": "Greek", "asian": "Asian",
+        "thai": "Thai", "japanese": "Japanese", "korean": "Korean",
     }
-    if re.search(r"prefer\s+(\w+(\s+\w+)?)\s+cuisine|like\s+(\w+(\s+\w+)?)\s+(cuisine|food|recipes?)", m):
-        for key, val in cuisine_map.items():
-            if key in m:
-                existing = updates.get("cuisine_preferences", [])
-                if val not in existing:
-                    updates["cuisine_preferences"] = existing + [val]
+    for key, val in cuisine_map.items():
+        if re.search(rf"prefer\s+{key}|like\s+{key}\s+(food|cuisine|recipes?)", m):
+            updates.setdefault("cuisine_preferences", [])
+            if val not in updates["cuisine_preferences"]:
+                updates["cuisine_preferences"].append(val)
 
-    # Currency / budget
-    inr_pattern = r"(₹|inr|rupees?|set\s+currency\s+(to\s+)?(inr|₹|rupees?)|use\s+(inr|₹|rupees?)|add\s+₹)"
+    inr_pattern = r"(₹|inr|rupees?|set\s+currency\s+(to\s+)?(inr|₹|rupees?))"
     if re.search(inr_pattern, m):
         budget_match = re.search(r"budget\s+(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(rupees?|₹|inr)", m)
         amount = float(budget_match.group(1) or budget_match.group(2)) if budget_match else None
@@ -134,32 +133,9 @@ def _regex_extract_profile(message: str) -> Dict[str, Any]:
             bp["amount"] = amount
         updates["budget_preference"] = bp
 
-    usd_pattern = r"(usd|\$|dollars?|set\s+currency\s+(to\s+)?(usd|\$|dollars?)|use\s+(usd|\$|dollars?))"
-    if re.search(usd_pattern, m) and "budget_preference" not in updates:
-        budget_match = re.search(r"budget\s+\$?(\d+(?:\.\d+)?)", m)
-        amount = float(budget_match.group(1)) if budget_match else None
-        bp = {"currency": "USD", "level": "medium"}
-        if amount:
-            bp["amount"] = amount
-        updates["budget_preference"] = bp
-
-    # Protein focus
-    if re.search(r"high[\s-]?protein|focus\s+(on\s+)?protein|protein[\s-]?rich|want\s+more\s+protein", m):
-        updates["protein_focus"] = True
-
-    # Skill level
-    if re.search(r"i'?m\s+(a\s+)?(beginner|novice|just\s+started|new\s+to\s+cooking)", m):
-        updates["skill_level"] = "beginner"
-    elif re.search(r"i'?m\s+(an?\s+)?(advanced|expert|professional|experienced)\s+cook", m):
-        updates["skill_level"] = "advanced"
-    elif re.search(r"i'?m\s+(an?\s+)?(intermediate|decent|okay|alright)\s+cook", m):
-        updates["skill_level"] = "intermediate"
-
-    # Allergies
     allergen_match = re.findall(
         r"allerg(ic|y)\s+to\s+([\w\s,]+?)(?:\.|,|and|$)|"
-        r"can'?t\s+eat\s+([\w\s,]+?)(?:\.|,|and|$)|"
-        r"intolerant\s+to\s+([\w\s,]+?)(?:\.|,|and|$)",
+        r"can'?t\s+eat\s+([\w\s,]+?)(?:\.|,|and|$)",
         m
     )
     if allergen_match:
@@ -173,24 +149,17 @@ def _regex_extract_profile(message: str) -> Dict[str, Any]:
         if allergens:
             updates["allergies"] = allergens
 
-    # Health conditions
     conditions = []
     if re.search(r"\bdiabetes\b|\bdiabetic\b", m):
         conditions.append("diabetes")
     if re.search(r"\bhypertension\b|\bhigh\s+blood\s+pressure\b", m):
         conditions.append("hypertension")
-    if re.search(r"\bceliac\b|\bgluten\s+intoleran", m):
-        conditions.append("celiac")
-    if re.search(r"\bhigh\s+cholesterol\b", m):
-        conditions.append("high cholesterol")
     if conditions:
         updates["health_conditions"] = conditions
 
-    # Calorie goal
     cal_match = re.search(
-        r"(\d{3,4})\s*(kcal|calories?)\s*(per\s+meal|a\s+meal|per\s+day)?|"
-        r"(under|below|less\s+than)\s+(\d{3,4})\s*(kcal|calories?)",
-        m
+        r"(\d{3,4})\s*(kcal|calories?)\s*(per\s+meal|a\s+meal)?|"
+        r"(under|below)\s+(\d{3,4})\s*(kcal|calories?)", m
     )
     if cal_match:
         raw_val = cal_match.group(1) or cal_match.group(5)
@@ -206,10 +175,8 @@ def profile_extraction_agent(
     profile_db: UserProfileDB,
     client,
 ) -> Dict[str, Any]:
-    """Extract preferences from user message and update persistent profile."""
     current_profile = profile_db.get_full_profile()
 
-    # Step 1: Regex pre-pass (fast, deterministic)
     regex_updates = _regex_extract_profile(user_message)
     for key, value in regex_updates.items():
         if value is not None and value != "" and value != [] and value != {}:
@@ -225,7 +192,6 @@ def profile_extraction_agent(
 
     current_profile = profile_db.get_full_profile()
 
-    # Step 2: LLM pass for nuanced extractions
     recent = conversation_history[-6:] if conversation_history else []
     history_text = "\n".join(
         f"{m['role'].upper()}: {m['content'][:300]}" for m in recent
@@ -325,26 +291,16 @@ def get_diet_constraints_string(profile: Dict[str, Any]) -> str:
             constraints.append("VEGETARIAN — NO meat, chicken, fish, seafood, or any animal flesh")
         elif diet_l == "keto":
             constraints.append("KETO — Under 20g net carbs, high fat, moderate protein")
-        elif diet_l == "paleo":
-            constraints.append("PALEO — No grains, legumes, dairy, processed foods")
-        elif diet_l == "pescatarian":
-            constraints.append("PESCATARIAN — No meat/chicken, fish/seafood allowed")
         else:
             constraints.append(f"Diet: {diet}")
 
     allergies = profile.get("allergies", [])
     if allergies:
-        if isinstance(allergies, list):
-            constraints.append(f"ALLERGIES (NEVER USE): {', '.join(allergies)}")
-        else:
-            constraints.append(f"ALLERGIES (NEVER USE): {allergies}")
+        constraints.append(f"ALLERGIES (NEVER USE): {', '.join(allergies if isinstance(allergies, list) else [allergies])}")
 
     avoid = profile.get("avoid_ingredients", [])
     if avoid:
-        if isinstance(avoid, list):
-            constraints.append(f"AVOID: {', '.join(avoid)}")
-        else:
-            constraints.append(f"AVOID: {avoid}")
+        constraints.append(f"AVOID: {', '.join(avoid if isinstance(avoid, list) else [avoid])}")
 
     health = profile.get("health_conditions", [])
     if health:
@@ -353,10 +309,6 @@ def get_diet_constraints_string(profile: Dict[str, Any]) -> str:
             constraints.append("DIABETIC — Low GI, limit sugar and refined carbs, max 45g carbs/meal")
         if "hypertension" in hl:
             constraints.append("HYPERTENSION — Low sodium (<1500mg/day)")
-        if "celiac" in hl:
-            constraints.append("CELIAC — Strictly gluten-free")
-        if "high cholesterol" in hl:
-            constraints.append("HIGH CHOLESTEROL — Limit saturated fat, avoid trans fats")
 
     if profile.get("protein_focus"):
         constraints.append("HIGH PROTEIN — 30g+ protein per serving")
@@ -370,17 +322,14 @@ def get_diet_constraints_string(profile: Dict[str, Any]) -> str:
     budget = profile.get("budget_preference", {})
     if isinstance(budget, dict) and budget.get("currency") == "INR":
         constraints.append("CURRENCY: Indian Rupees (₹)")
-    elif isinstance(budget, str) and "INR" in budget.upper():
-        constraints.append("CURRENCY: Indian Rupees (₹)")
 
     return "\n".join(f"  ⚠️ {c}" for c in constraints) if constraints else "None"
 
 
 def _currency(profile: dict) -> str:
-    """Return '₹' if the user has set INR currency, else '$'."""
     b = profile.get("budget_preference", {})
     if isinstance(b, dict) and b.get("currency") == "INR":
         return "₹"
     if isinstance(b, str) and "INR" in b.upper():
         return "₹"
-    return "$"
+    return "₹"  # Default to INR for Indian app
