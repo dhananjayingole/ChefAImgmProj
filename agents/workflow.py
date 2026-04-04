@@ -1,4 +1,4 @@
-"""agents/workflow.py — Multi-user LangGraph workflow with user_id threading."""
+"""agents/workflow.py — Fixed: conversation history threading, context persistence."""
 
 import functools
 from langgraph.graph import StateGraph, END
@@ -34,6 +34,8 @@ def route_by_intent(state: AgentState) -> str:
         "budget_analysis":       "end",
         "cooking_tips":          "end",
         "start_cooking_mode":    "end",
+        "invalid_input":         "end",
+        "context_followup":      "end",
     }
     return routes.get(intent, "end")
 
@@ -73,7 +75,7 @@ def create_workflow(client, db, recipe_kb, profile_db: UserProfileDB = None, fee
 
 def build_initial_state(
     user_query: str,
-    user_id: str = "default",            # ← MULTI-USER: always pass this
+    user_id: str = "default",
     dietary_restrictions: list = None,
     health_conditions: list = None,
     calorie_limit: int = 600,
@@ -85,44 +87,43 @@ def build_initial_state(
 ) -> AgentState:
     """
     Build the initial AgentState for a pipeline run.
-    user_id is propagated into state so every agent and the streaming
-    pipeline can resolve the correct per-user databases.
+    
+    CRITICAL: conversation_history is passed in so agents have full context
+    of what was discussed before — enabling recipe modification, follow-ups, etc.
     """
     state = AgentState(
-        user_query           = user_query,
-        available_ingredients= extra_ingredients or [],
-        dietary_restrictions = dietary_restrictions or [],
-        health_conditions    = health_conditions or [],
-        calorie_limit        = calorie_limit,
-        budget_limit         = budget_limit,
-        servings             = servings,
-        cuisine_preference   = cuisine_preference,
-        conversation_history = conversation_history or [],
-        conversation_summary = "",
-        user_profile         = {},
-        intent               = "general",
-        intent_confidence    = 0.0,
-        needs_clarification  = False,
+        user_query            = user_query,
+        available_ingredients = extra_ingredients or [],
+        dietary_restrictions  = dietary_restrictions or [],
+        health_conditions     = health_conditions or [],
+        calorie_limit         = calorie_limit,
+        budget_limit          = budget_limit,
+        servings              = servings,
+        cuisine_preference    = cuisine_preference,
+        conversation_history  = conversation_history or [],  # ← FULL HISTORY passed in
+        conversation_summary  = "",
+        user_profile          = {},
+        intent                = "general",
+        intent_confidence     = 0.0,
+        needs_clarification   = False,
         clarification_question = "",
-        ingredient_analysis  = "",
+        ingredient_analysis   = "",
         health_recommendations = "",
-        rag_results          = "",
-        generated_recipe     = "",
+        rag_results           = "",
+        generated_recipe      = "",          # Will be restored from history by MemoryAgent
         recipe_ingredients_structured = [],
-        budget_analysis      = {},
-        waste_score          = {},
-        shopping_list        = "",
-        nutrition_data       = {},
-        total_nutrition      = {},
-        final_output         = "",
-        assistant_message    = "",
-        errors               = [],
-        agent_logs           = [],
-        processing_time      = {},
-        retry_count          = 0,
+        budget_analysis       = {},
+        waste_score           = {},
+        shopping_list         = "",
+        nutrition_data        = {},
+        total_nutrition       = {},
+        final_output          = "",
+        assistant_message     = "",
+        errors                = [],
+        agent_logs            = [],
+        processing_time       = {},
+        retry_count           = 0,
     )
 
-    # ── CRITICAL: store user_id in state so the pipeline can use it ───────
     state["user_id"] = user_id
-
     return state

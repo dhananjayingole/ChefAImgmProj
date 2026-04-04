@@ -1,11 +1,11 @@
 """
-agents/streaming_pipeline.py — Full multi-user support.
-Every pipeline run reads state["user_id"] and routes to that user's private databases.
+agents/streaming_pipeline.py — Fixed: conversational invalid input, greeting, context followup.
 """
 
 import time
 import re
 from typing import Generator
+from agents.receipe_agent import RecipeAgent
 from agents.state import AgentState
 from agents.pantry_agent import detect_pantry_intent
 
@@ -13,7 +13,6 @@ from agents.pantry_agent import detect_pantry_intent
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _safe(fn, state, *args, **kwargs):
-    """Call fn safely; return (state, error_str|None)."""
     try:
         result = fn(*args, **kwargs)
         return (result if result is not None else state), None
@@ -32,7 +31,6 @@ def _phase(agent: str, status: str, **extra):
 
 
 def _guard_intent(state: AgentState) -> AgentState:
-    """Override 'general' intent when pantry patterns are detected."""
     if state.get("intent", "general") != "general":
         return state
     detected = detect_pantry_intent(state.get("user_query", ""))
@@ -42,21 +40,16 @@ def _guard_intent(state: AgentState) -> AgentState:
 
 
 def _resolve_user_services(state: AgentState, db, profile_db, feedback_db):
-    """
-    If state carries a user_id, always use that user's private databases
-    instead of whatever was passed as positional args.
-    This is the central isolation gate — all code paths funnel through here.
-    """
     user_id = state.get("user_id")
     if user_id:
         try:
             from services.user_services import get_user_services
-            svc        = get_user_services(user_id)
-            db         = svc["db"]
-            profile_db = svc["profile_db"]
+            svc = get_user_services(user_id)
+            db          = svc["db"]
+            profile_db  = svc["profile_db"]
             feedback_db = svc["feedback_db"]
         except Exception:
-            pass   # Fallback to whatever was passed in — better than crashing
+            pass
     return db, profile_db, feedback_db
 
 
@@ -70,13 +63,8 @@ def run_streaming_pipeline(
     profile_db=None,
     feedback_db=None,
 ) -> Generator:
-    """
-    Multi-user safe pipeline.
-    If state["user_id"] is set, every DB operation is routed to that user's
-    private SQLite files regardless of what db/profile_db/feedback_db were passed.
-    """
 
-    # ── ISOLATION GATE: override DBs from user_id in state ───────────────
+    # ── ISOLATION GATE ────────────────────────────────────────────────────
     db, profile_db, feedback_db = _resolve_user_services(
         state, db, profile_db, feedback_db
     )
@@ -86,7 +74,7 @@ def run_streaming_pipeline(
     t0 = time.time()
     try:
         from agents.memory_agent import MemoryAgent
-        ma    = MemoryAgent()
+        ma = MemoryAgent()
         state, err = _safe(ma.run, state, state, profile_db=profile_db, client=client)
     except Exception as e:
         err = str(e)
@@ -106,23 +94,21 @@ def run_streaming_pipeline(
     yield _phase("🎯 Intent Agent", "done", time=round(time.time() - t0, 2), intent=intent)
 
     # ════════════════════════════════════════════════════════════════════════
+    # INVALID INPUT — conversational, warm response
+    # ════════════════════════════════════════════════════════════════════════
+    if intent == "invalid_input":
+        msg = _invalid_input_response(state, client)
+        state["assistant_message"] = msg
+        yield from _stream(msg)
+        yield {"type": "complete", "state": state}
+        return
+
+    # ════════════════════════════════════════════════════════════════════════
     # GREETING
     # ════════════════════════════════════════════════════════════════════════
     if intent == "greeting":
-        profile   = state.get("user_profile", {})
-        diet_hint = f" I know you're {profile['diet_type']}." if profile.get("diet_type") else ""
-        msg = (
-            f"👋 Hey there! I'm **NutriBot**, your smart meal assistant.{diet_hint}\n\n"
-            "Here's what I can do:\n"
-            "• 📦 **Track pantry** — tell me what you bought\n"
-            "• 🍳 **Generate recipes** — personalised to your diet & health\n"
-            "• 📅 **Plan weekly meals** — balanced & within budget\n"
-            "• 📊 **Track nutrition** — daily calories, protein, carbs\n"
-            "• 💰 **Budget tips** — real ₹ prices\n"
-            "• 🛒 **Shopping lists** — only what you need\n"
-            "• 🌱 **Eco scores** — reduce food waste\n\n"
-            "What would you like to do today?"
-        )
+        profile = state.get("user_profile", {})
+        msg = _build_greeting(profile)
         state["assistant_message"] = msg
         yield from _stream(msg)
         yield {"type": "complete", "state": state}
@@ -141,6 +127,19 @@ def run_streaming_pipeline(
         yield _phase("🧠 Memory Agent", "done" if not err else "error",
                      time=round(time.time() - t0, 2))
         yield from _stream(state.get("assistant_message", "No profile found."))
+        yield {"type": "complete", "state": state}
+        return
+
+    # ════════════════════════════════════════════════════════════════════════
+    # CONTEXT FOLLOWUP — answer questions about the last recipe
+    # ════════════════════════════════════════════════════════════════════════
+    elif intent == "context_followup":
+        yield _phase("🍳 Recipe Agent", "running")
+        t0 = time.time()
+        msg = _context_followup_response(state, client)
+        state["assistant_message"] = msg
+        yield _phase("🍳 Recipe Agent", "done", time=round(time.time() - t0, 2))
+        yield from _stream(msg)
         yield {"type": "complete", "state": state}
         return
 
@@ -329,7 +328,7 @@ def run_streaming_pipeline(
             )
             resp = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
-                messages=[{"role":"user","content":prompt}],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.4, max_tokens=400,
             )
             msg = resp.choices[0].message.content.strip()
@@ -369,7 +368,7 @@ def run_streaming_pipeline(
                     by_date[m.get("plan_date", "?")].append(m)
                 lines = ["## 📅 Meal Calendar — Last 7 Days\n"]
                 for d in sorted(by_date.keys(), reverse=True):
-                    label     = "**Today**" if d == date.today().isoformat() else f"**{d}**"
+                    label = "**Today**" if d == date.today().isoformat() else f"**{d}**"
                     total_cal = 0
                     lines.append(label)
                     for m in by_date[d]:
@@ -402,17 +401,19 @@ def run_streaming_pipeline(
             state["assistant_message"] = (
                 "🍳 **Cooking Mode Ready!**\n\n"
                 "Click **'🍳 Start Cooking Mode'** button to begin step-by-step guidance.\n\n"
-                "I'll walk you through each step with timers."
+                "I'll walk you through each step with timers. 👨‍🍳"
             )
         else:
-            state["assistant_message"] = "❌ No recipe found. Please generate a recipe first."
+            state["assistant_message"] = (
+                "❌ No recipe found yet. Please generate a recipe first, then say 'start cooking mode'!"
+            )
         yield _phase("🍳 Recipe Agent", "done", time=round(time.time() - t0, 2))
         yield from _stream(state.get("assistant_message", ""))
         yield {"type": "complete", "state": state}
         return
 
     # ════════════════════════════════════════════════════════════════════════
-    # GENERAL FALLBACK
+    # GENERAL FALLBACK — conversational LLM response
     # ════════════════════════════════════════════════════════════════════════
     else:
         yield _phase("🧠 Memory Agent", "running")
@@ -449,8 +450,7 @@ def _run_recipe_pipeline(state, client, db, recipe_kb) -> Generator:
     yield _phase("🍳 Recipe Agent", "running")
     t0 = time.time()
     try:
-        from agents.receipe_agent import RecipeAgent
-        ra    = RecipeAgent()
+        ra = RecipeAgent()
         state, err = _safe(ra.run, state, state, client=client)
     except Exception as e:
         state["generated_recipe"] = f"Recipe generation failed: {e}"
@@ -560,8 +560,8 @@ def _handle_rating(state: AgentState, feedback_db) -> AgentState:
     else:
         rating = 4
 
-    last_recipe  = _find_last_recipe(state)
-    recipe_name  = "Previous Recipe"
+    last_recipe = _find_last_recipe(state)
+    recipe_name = "Previous Recipe"
     if last_recipe:
         nm = re.search(r"##\s*🍽️\s*(.+)", last_recipe)
         if nm:
@@ -589,22 +589,28 @@ def _handle_rating(state: AgentState, feedback_db) -> AgentState:
 
     stars     = "⭐" * rating + "☆" * (5 - rating)
     reactions = {
-        5: "Wonderful! I'll suggest similar recipes more often.",
-        4: "Great feedback! I'll remember what you enjoyed.",
-        3: "Thanks — I'll try to improve next time.",
-        2: "Sorry it wasn't great. I'll suggest something different.",
-        1: "I'll avoid this style entirely.",
+        5: "Wonderful! That makes me so happy to hear! 🎉 I'll suggest similar recipes more often.",
+        4: "Great to know! I'll remember what you enjoyed for next time. 😊",
+        3: "Thanks for the feedback — I'll work on improving! What could be better?",
+        2: "Sorry it wasn't great. I'll suggest something different next time. 🙏",
+        1: "I apologise — I'll completely change my approach for you!",
     }
     state["assistant_message"] = (
         f"## {stars} Rating Saved!\n\n"
         f"**{recipe_name}** — {rating}/5 stars\n\n"
         f"{reactions.get(rating,'Thanks!')}\n\n"
-        f"*Your taste profile is now smarter — better recommendations coming!*"
+        f"*Your taste profile is now smarter — better recommendations coming!* 🧠"
     )
     return state
 
 
 def _find_last_recipe(state: AgentState) -> str:
+    # First check state directly
+    recipe = state.get("generated_recipe", "")
+    if recipe and "## 🍽️" in recipe:
+        return recipe
+
+    # Then check conversation history
     history = state.get("conversation_history", [])
     for msg in reversed(history):
         if msg.get("role") == "assistant":
@@ -612,6 +618,148 @@ def _find_last_recipe(state: AgentState) -> str:
             if "## 🍽️" in content and "### 📋 Ingredients" in content:
                 return content
     return ""
+
+
+# ── CONVERSATIONAL RESPONSE BUILDERS ─────────────────────────────────────────
+
+def _invalid_input_response(state: AgentState, client) -> str:
+    """Generate a warm, conversational response for invalid/gibberish input."""
+    query = state.get("user_query", "")
+    profile = state.get("user_profile", {})
+    name = profile.get("name", "")
+    name_part = f", {name}" if name else ""
+
+    # Try LLM for a natural response
+    if client:
+        try:
+            history = state.get("conversation_history", [])
+            recent_ctx = ""
+            if history:
+                last_few = history[-4:]
+                recent_ctx = "\n".join(
+                    f"{m['role'].upper()}: {m['content'][:100]}" for m in last_few
+                )
+
+            prompt = f"""You are NutriBot, a warm and friendly AI meal assistant.
+The user sent a message that doesn't seem to be a valid cooking/food query.
+
+User message: "{query}"
+{f'Recent context: {recent_ctx}' if recent_ctx else ''}
+User profile: {profile.get('diet_type', 'not set')} diet, {profile.get('fitness_goal', 'no specific goal')}
+
+Respond in a warm, conversational way. Possibilities:
+- If it looks like a typo or incomplete message, guess what they might have meant and offer to help
+- If it's clearly gibberish/keyboard mashing, gently let them know you didn't understand and offer helpful suggestions
+- Suggest 2-3 specific things you CAN help with, personalised to their profile if known
+- Keep it short (3-4 sentences max), friendly, and helpful
+- Do NOT say "I cannot understand" or be robotic — be warm like a friend
+
+Do not use bullet points for suggestions — write naturally."""
+
+            resp = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=150,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            pass
+
+    # Fallback static responses
+    diet = profile.get("diet_type", "")
+    diet_hint = f" Since you're {diet}, I can suggest some great {diet} recipes!" if diet else ""
+
+    return (
+        f"Hmm, I didn't quite catch that{name_part}! 😊{diet_hint}\n\n"
+        "Here are some things I can help you with — just try one:\n"
+        "• *\"Make me palak paneer\"* — for a recipe\n"
+        "• *\"I bought 500g paneer\"* — to track groceries\n"
+        "• *\"Plan my meals for 3 days\"* — for a meal plan"
+    )
+
+
+def _build_greeting(profile: dict) -> str:
+    """Build a personalized, warm greeting."""
+    name = profile.get("name", "")
+    diet = profile.get("diet_type", "")
+    goal = profile.get("fitness_goal", "")
+    conditions = profile.get("health_conditions", [])
+
+    # Returning user with profile
+    if profile:
+        name_part  = f" {name}!" if name else "!"
+        diet_part  = f" I know you're **{diet}**." if diet else ""
+        goal_part  = f" Working towards **{goal.replace('_', ' ')}** — great!" if goal else ""
+        cond_part  = ""
+        if conditions:
+            conds = conditions if isinstance(conditions, list) else [conditions]
+            cond_part = f" I'll keep your **{', '.join(conds)}** in mind for all recipes."
+
+        return (
+            f"Hey there{name_part} Welcome back to **NutriBot**! 🥗{diet_part}{goal_part}{cond_part}\n\n"
+            "What can I help you with today?\n\n"
+            "• 🍳 Generate a recipe\n"
+            "• 📦 Track pantry items\n"
+            "• 📅 Plan your weekly meals\n"
+            "• 📊 Check today's nutrition\n"
+            "• 💰 Budget-friendly ideas\n\n"
+            "*Just tell me what you need in plain English!*"
+        )
+    else:
+        # First-time user
+        return (
+            "👋 Hey there! I'm **NutriBot**, your personal AI meal assistant!\n\n"
+            "I can help you:\n"
+            "• 🍳 **Generate recipes** personalised to your diet & health\n"
+            "• 📦 **Track your pantry** and reduce food waste\n"
+            "• 📅 **Plan weekly meals** within your budget\n"
+            "• 📊 **Monitor nutrition** — calories, protein, carbs\n"
+            "• 💰 **Save money** with smart ingredient choices\n"
+            "• 🌱 **Reduce carbon footprint** with eco scores\n\n"
+            "To get started, tell me a bit about yourself! For example:\n"
+            "*\"I'm vegetarian, trying to lose weight, and love Indian food\"*\n\n"
+            "Or just ask me anything — I'm here to help! 😊"
+        )
+
+
+def _context_followup_response(state: AgentState, client) -> str:
+    """Answer a follow-up question about the last recipe."""
+    query = state.get("user_query", "")
+    profile = state.get("user_profile", {})
+    last_recipe = _find_last_recipe(state)
+
+    if not last_recipe:
+        return (
+            "I don't have a recipe in context right now. "
+            "Generate one first and then ask me follow-up questions! 🍳"
+        )
+
+    if client:
+        try:
+            prompt = f"""You are NutriBot, a helpful cooking assistant.
+The user is asking a follow-up question about a recipe we just discussed.
+
+RECIPE CONTEXT (first 1500 chars):
+{last_recipe[:1500]}
+
+USER'S FOLLOW-UP QUESTION: "{query}"
+
+Answer the question directly and helpfully, referencing the specific recipe.
+Keep it conversational and concise (under 150 words).
+User profile: {profile.get('diet_type', 'not set')} diet."""
+
+            resp = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=200,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            return f"I had trouble answering that. Could you rephrase? ({e})"
+
+    return "Could you clarify your question? I want to make sure I help you correctly! 😊"
 
 
 # ── Budget response ───────────────────────────────────────────────────────────
@@ -688,36 +836,55 @@ def _eco_response(state: AgentState, db) -> str:
     return "\n".join(lines)
 
 
-# ── General fallback ──────────────────────────────────────────────────────────
+# ── General fallback — CONVERSATIONAL ────────────────────────────────────────
 
 def _general_response(state: AgentState, client) -> str:
+    """Fully conversational general response using LLM with full context."""
     try:
         profile  = state.get("user_profile", {})
         history  = state.get("conversation_history", [])
         query    = state.get("user_query", "")
-        hist_txt = "\n".join(
-            f"{m['role'].upper()}: {m['content'][:200]}" for m in history[-6:]
-        ) if history else ""
+        last_recipe = _find_last_recipe(state)
+
+        # Build rich context
+        hist_txt = ""
+        if history:
+            hist_txt = "\n".join(
+                f"{m['role'].upper()}: {m['content'][:200]}" for m in history[-8:]
+            )
+
+        recipe_ctx = ""
+        if last_recipe:
+            # Extract just the name
+            nm = re.search(r"##\s*🍽️\s*(.+)", last_recipe)
+            if nm:
+                recipe_ctx = f"\nLast recipe discussed: {nm.group(1).strip()}"
+
         from agents.user_profile import get_profile_context_string
         prompt = (
-            f"You are NutriBot, a smart meal assistant specialising in Indian nutrition.\n\n"
-            f"{get_profile_context_string(profile)}\n\n"
-            + (f"CONVERSATION:\n{hist_txt}\n\n" if hist_txt else "")
-            + f"USER: {query}\n\nBe helpful, warm, specific. Under 200 words."
+            f"You are NutriBot, a warm, friendly AI meal assistant specialising in Indian nutrition.\n"
+            f"Respond conversationally — like a knowledgeable friend, not a robot.\n\n"
+            f"{get_profile_context_string(profile)}\n"
+            f"{recipe_ctx}\n\n"
+            + (f"RECENT CONVERSATION:\n{hist_txt}\n\n" if hist_txt else "")
+            + f"USER: {query}\n\n"
+            "Be helpful, warm, and specific. If you can connect to their food/health goals, do so. "
+            "Under 200 words. No bullet lists unless the question specifically calls for them."
         )
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.5, max_tokens=350,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.6, max_tokens=350,
         )
         return resp.choices[0].message.content.strip()
     except Exception:
         return (
-            "I'm here to help! Try:\n"
-            "• 📦 'I bought 500g paneer'\n"
-            "• 🍳 'Make me palak paneer'\n"
-            "• 📅 'Plan my meals for 3 days'\n"
-            "• 📊 'Show my daily nutrition'"
+            "I'm here to help! Here are some things you can try:\n"
+            "• 📦 *'I bought 500g paneer'* — track groceries\n"
+            "• 🍳 *'Make me palak paneer'* — get a recipe\n"
+            "• 📅 *'Plan my meals for 3 days'* — meal planning\n"
+            "• 📊 *'Show my daily nutrition'* — track intake\n\n"
+            "Just ask in plain English! 😊"
         )
 
 
@@ -727,15 +894,15 @@ def _health_fallback(state: AgentState, client) -> str:
         query   = state.get("user_query", "")
         conds   = profile.get("health_conditions", [])
         prompt  = (
-            f'You are a certified nutritionist. Answer:\n\n"{query}"\n\n'
-            f'Patient: {profile.get("diet_type","vegetarian")}, conditions: {conds}\n\n'
-            "Evidence-based, practical, under 250 words."
+            f'You are a certified nutritionist. Answer this question warmly and helpfully:\n\n"{query}"\n\n'
+            f'Patient profile: {profile.get("diet_type","vegetarian")} diet, conditions: {conds}\n\n'
+            "Evidence-based, practical, under 250 words. Be conversational and supportive."
         )
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role":"user","content":prompt}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.3, max_tokens=450,
         )
         return resp.choices[0].message.content.strip()
     except Exception:
-        return "Health advice is temporarily unavailable."
+        return "Health advice is temporarily unavailable. Please try again in a moment! 🙏"

@@ -2,6 +2,10 @@
 backend/main.py — NutriBot Backend API v6.0
 Full per-user data isolation. Every endpoint receives a user_id and
 routes to that user's private database files.
+
+LLM Strategy:
+  - Groq  → all chat, recipe, nutrition, health, planning agents (fast, free)
+  - Gemini → ONLY /fridge/scan and /vision/analyze (vision capability)
 """
 
 import os
@@ -25,26 +29,47 @@ if ROOT not in sys.path:
 from dotenv import load_dotenv
 load_dotenv()
 
-# ── Shared / global services (not user-specific) ──────────────────────────────
-_global_client    = None
-_global_recipe_kb = None
+# ── Global services ───────────────────────────────────────────────────────────
+_global_client       = None   # Groq  — used by ALL non-vision endpoints
+_global_recipe_kb    = None   # recipe knowledge base (shared/read-only)
+_global_gemini_model = None   # Gemini — used ONLY by /fridge/scan and /vision/analyze
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _global_client, _global_recipe_kb
+    global _global_client, _global_recipe_kb, _global_gemini_model
+
     print("🚀 Starting NutriBot Backend API v6.0 (per-user isolation)...")
 
+    # ── Groq (all agents) ─────────────────────────────────────────────────
     from groq import Groq
     from tools.tools import load_recipe_dataset, build_recipe_knowledge_base
 
     groq_key = os.getenv("GROQ_API_KEY", "")
-    _global_client = Groq(api_key=groq_key) if groq_key else None
+    if groq_key:
+        _global_client = Groq(api_key=groq_key)
+        print("✅ Groq client ready")
+    else:
+        print("⚠️  GROQ_API_KEY not set — LLM features disabled")
 
-    dataset       = load_recipe_dataset()
+    dataset = load_recipe_dataset()
     _global_recipe_kb = build_recipe_knowledge_base(dataset)
+    print("✅ Recipe knowledge base ready")
 
-    print("✅ Global services ready")
+    # ── Gemini (vision only) ──────────────────────────────────────────────
+    gemini_key = os.getenv("GEMINI_API_KEY", "")
+    if gemini_key:
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=gemini_key)
+            _global_gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+            print("✅ Gemini Vision ready (fridge scanner active)")
+        except Exception as e:
+            print(f"⚠️  Gemini init failed: {e} — fridge scanner disabled")
+    else:
+        print("⚠️  GEMINI_API_KEY not set — fridge scanner disabled")
+
+    print("✅ All global services ready")
     yield
     print("🛑 Shutting down...")
 
@@ -157,10 +182,10 @@ class EcoScoreRequest(BaseModel):
     ingredients: List[Dict[str, Any]]
 
 
-# ── Helper: resolve user services ─────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_svc(user_id: Optional[str]):
-    """Return per-user service objects."""
+    """Return per-user service objects (Groq-based)."""
     from services.user_services import get_user_services
     return get_user_services(user_id or "default")
 
@@ -171,7 +196,7 @@ def _get_state(msg: UserMessage):
     svc   = _get_svc(msg.user_id)
     state = build_initial_state(
         user_query           = msg.query,
-        user_id              = msg.user_id or "default",   # ← CRITICAL
+        user_id              = msg.user_id or "default",
         dietary_restrictions = msg.dietary_restrictions or [],
         health_conditions    = msg.health_conditions   or [],
         calorie_limit        = msg.calorie_limit or 500,
@@ -186,22 +211,30 @@ def _get_state(msg: UserMessage):
     return state, svc
 
 
-# ── System endpoints ──────────────────────────────────────────────────────────
+# ── System ────────────────────────────────────────────────────────────────────
 
 @app.get("/", response_model=APIResponse, tags=["System"])
 async def root():
     return APIResponse(
         success=True, message="NutriBot API v6.0",
-        data={"version": "6.0.0", "groq_available": bool(_global_client)}
+        data={
+            "version":         "6.0.0",
+            "groq_available":  bool(_global_client),
+            "gemini_available": bool(_global_gemini_model),
+        }
     )
 
 
 @app.get("/health", tags=["System"])
 async def health_check():
-    return {"status": "healthy", "groq": bool(_global_client)}
+    return {
+        "status":  "healthy",
+        "groq":    bool(_global_client),
+        "gemini":  bool(_global_gemini_model),
+    }
 
 
-# ── Chat ──────────────────────────────────────────────────────────────────────
+# ── Chat (Groq) ───────────────────────────────────────────────────────────────
 
 @app.post("/chat", response_model=APIResponse, tags=["Chat"])
 async def chat(message: UserMessage):
@@ -211,7 +244,7 @@ async def chat(message: UserMessage):
     final_state = state
 
     for event in run_streaming_pipeline(
-        state, _global_client,
+        state, _global_client,          # ← Groq
         svc["db"], _global_recipe_kb,
         profile_db  = svc["profile_db"],
         feedback_db = svc["feedback_db"],
@@ -247,7 +280,7 @@ async def chat_stream(message: UserMessage):
     async def generate():
         state, svc = _get_state(message)
         for event in run_streaming_pipeline(
-            state, _global_client,
+            state, _global_client,      # ← Groq
             svc["db"], _global_recipe_kb,
             profile_db  = svc["profile_db"],
             feedback_db = svc["feedback_db"],
@@ -255,11 +288,14 @@ async def chat_stream(message: UserMessage):
             yield f"data: {json.dumps(event)}\n\n"
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(generate(), media_type="text/event-stream",
-                             headers={"Cache-Control":"no-cache","Connection":"keep-alive"})
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
 
 
-# ── Profile endpoints ─────────────────────────────────────────────────────────
+# ── Profile (Groq) ────────────────────────────────────────────────────────────
 
 @app.get("/profile/{user_id}", response_model=APIResponse, tags=["Profile"])
 async def get_profile(user_id: str):
@@ -288,15 +324,17 @@ async def reset_profile(user_id: str):
     return APIResponse(success=True, message="Profile reset", data={"user_id": user_id})
 
 
-# ── Pantry endpoints ──────────────────────────────────────────────────────────
+# ── Pantry ────────────────────────────────────────────────────────────────────
 
 @app.get("/pantry", response_model=APIResponse, tags=["Pantry"])
 async def get_pantry(user_id: str = Query("default")):
     svc   = _get_svc(user_id)
     items = svc["db"].get_all_groceries()
-    return APIResponse(success=True, message="Pantry retrieved",
-                       data={"items": items, "count": len(items),
-                             "expiring_soon": svc["db"].get_expiring_soon(3)})
+    return APIResponse(
+        success=True, message="Pantry retrieved",
+        data={"items": items, "count": len(items),
+              "expiring_soon": svc["db"].get_expiring_soon(3)},
+    )
 
 
 @app.post("/pantry", response_model=APIResponse, tags=["Pantry"])
@@ -320,7 +358,8 @@ async def remove_from_pantry(item: GroceryItemRemove, user_id: str = Query("defa
     svc = _get_svc(user_id)
     ok  = svc["db"].delete_grocery(item.item_name)
     if ok:
-        return APIResponse(success=True, message=f"Removed {item.item_name}", data={"removed": item.item_name})
+        return APIResponse(success=True, message=f"Removed {item.item_name}",
+                           data={"removed": item.item_name})
     return APIResponse(success=False, message=f"{item.item_name} not found", error="Not found")
 
 
@@ -339,7 +378,7 @@ async def get_expiring(user_id: str = Query("default"), days: int = 3):
                        data={"items": expiring, "count": len(expiring)})
 
 
-# ── Recipe endpoints ──────────────────────────────────────────────────────────
+# ── Recipes (Groq) ────────────────────────────────────────────────────────────
 
 @app.post("/recipe/generate", response_model=APIResponse, tags=["Recipes"])
 async def generate_recipe(message: UserMessage):
@@ -347,16 +386,17 @@ async def generate_recipe(message: UserMessage):
 
     state, svc = _get_state(message)
     state["available_ingredients"] = [g["item_name"] for g in svc["db"].get_all_groceries()]
-
-    state = RecipeAgent().run(state, client=_global_client)
-    return APIResponse(success=True, message="Recipe generated",
-                       data={
-                           "recipe":      state.get("generated_recipe", ""),
-                           "ingredients": state.get("recipe_ingredients_structured", []),
-                           "nutrition":   state.get("nutrition_data"),
-                           "budget":      state.get("budget_analysis"),
-                           "eco_score":   state.get("eco_score"),
-                       })
+    state = RecipeAgent().run(state, client=_global_client)   # ← Groq
+    return APIResponse(
+        success=True, message="Recipe generated",
+        data={
+            "recipe":      state.get("generated_recipe", ""),
+            "ingredients": state.get("recipe_ingredients_structured", []),
+            "nutrition":   state.get("nutrition_data"),
+            "budget":      state.get("budget_analysis"),
+            "eco_score":   state.get("eco_score"),
+        },
+    )
 
 
 @app.post("/recipe/rate", response_model=APIResponse, tags=["Recipes"])
@@ -373,7 +413,7 @@ async def rate_recipe(rating: RecipeRating, user_id: str = Query("default")):
                        data={"recipe_name": rating.recipe_name, "rating": rating.rating, "id": rid})
 
 
-# ── Meal plan endpoints ───────────────────────────────────────────────────────
+# ── Meal plans (Groq) ─────────────────────────────────────────────────────────
 
 @app.get("/mealplan", response_model=APIResponse, tags=["Meal Plans"])
 async def get_meal_plans(user_id: str = Query("default"), days: int = 7):
@@ -391,7 +431,8 @@ async def get_today_meals(user_id: str = Query("default")):
     for m in meals:
         grouped.setdefault(m.get("meal_type", "other"), []).append(m)
     return APIResponse(success=True, message="Today's meals",
-                       data={"meals": meals, "grouped": grouped, "date": date.today().isoformat()})
+                       data={"meals": meals, "grouped": grouped,
+                             "date": date.today().isoformat()})
 
 
 @app.post("/mealplan", response_model=APIResponse, tags=["Meal Plans"])
@@ -421,12 +462,12 @@ async def weekly_plan(req: WeeklyPlanRequest):
     svc   = _get_svc(uid)
     state = build_initial_state(user_query=req.query, user_id=uid)
     state["user_profile"] = svc["profile_db"].get_full_profile()
-    state = meal_plan_agent(state, client=_global_client, db=svc["db"])
+    state = meal_plan_agent(state, client=_global_client, db=svc["db"])  # ← Groq
     return APIResponse(success=True, message="Weekly plan generated",
-                       data={"plan": state.get("assistant_message","")})
+                       data={"plan": state.get("assistant_message", "")})
 
 
-# ── Nutrition endpoints ───────────────────────────────────────────────────────
+# ── Nutrition (Groq) ──────────────────────────────────────────────────────────
 
 @app.get("/nutrition/today", response_model=APIResponse, tags=["Nutrition"])
 async def today_nutrition(user_id: str = Query("default")):
@@ -436,10 +477,10 @@ async def today_nutrition(user_id: str = Query("default")):
     svc   = _get_svc(user_id)
     state = build_initial_state(user_query="", user_id=user_id)
     state["user_profile"] = svc["profile_db"].get_full_profile()
-    state = get_daily_nutrition_summary(state, svc["db"], _global_client)
+    state = get_daily_nutrition_summary(state, svc["db"], _global_client)  # ← Groq
     return APIResponse(success=True, message="Today's nutrition",
-                       data={"summary": state.get("daily_nutrition_summary",{}),
-                             "message": state.get("assistant_message",""),
+                       data={"summary": state.get("daily_nutrition_summary", {}),
+                             "message": state.get("assistant_message", ""),
                              "date":    date.today().isoformat()})
 
 
@@ -449,18 +490,18 @@ async def weekly_nutrition(user_id: str = Query("default")):
     meals = svc["db"].get_meal_plans(7)
     daily: Dict[str, dict] = {}
     for m in meals:
-        day = m.get("plan_date","")
+        day = m.get("plan_date", "")
         if day not in daily:
-            daily[day] = {"calories":0,"protein_g":0,"carbs_g":0,"fat_g":0}
-        daily[day]["calories"]  += m.get("calories", 0)
-        daily[day]["protein_g"] += m.get("protein_g",0)
-        daily[day]["carbs_g"]   += m.get("carbs_g",  0)
-        daily[day]["fat_g"]     += m.get("fat_g",    0)
+            daily[day] = {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0}
+        daily[day]["calories"]  += m.get("calories",  0)
+        daily[day]["protein_g"] += m.get("protein_g", 0)
+        daily[day]["carbs_g"]   += m.get("carbs_g",   0)
+        daily[day]["fat_g"]     += m.get("fat_g",     0)
     return APIResponse(success=True, message="Weekly nutrition",
                        data={"daily_totals": daily, "meals": meals})
 
 
-# ── Budget endpoints ──────────────────────────────────────────────────────────
+# ── Budget ────────────────────────────────────────────────────────────────────
 
 @app.get("/budget/cheapest-protein", response_model=APIResponse, tags=["Budget"])
 async def cheapest_protein(user_id: str = Query("default"), diet_type: str = "vegetarian"):
@@ -477,14 +518,15 @@ async def all_prices(user_id: str = Query("default")):
 
 
 @app.get("/budget/price/{ingredient}", response_model=APIResponse, tags=["Budget"])
-async def ingredient_price(ingredient: str, user_id: str = Query("default"), quantity_kg: float = 1.0):
+async def ingredient_price(ingredient: str, user_id: str = Query("default"),
+                            quantity_kg: float = 1.0):
     svc   = _get_svc(user_id)
     price = svc["price_service"].get_price(ingredient, quantity_kg)
     return APIResponse(success=True, message=f"Price for {ingredient}",
                        data={"ingredient": ingredient, "price_inr": price})
 
 
-# ── Shopping endpoints ────────────────────────────────────────────────────────
+# ── Shopping (Groq) ───────────────────────────────────────────────────────────
 
 @app.post("/shopping/generate", response_model=APIResponse, tags=["Shopping"])
 async def shopping_list(req: ShoppingListRequest):
@@ -495,12 +537,12 @@ async def shopping_list(req: ShoppingListRequest):
     svc   = _get_svc(uid)
     state = build_initial_state(user_query=req.query, user_id=uid)
     state["user_profile"] = svc["profile_db"].get_full_profile()
-    state = shopping_agent(state, db=svc["db"], client=_global_client)
+    state = shopping_agent(state, db=svc["db"], client=_global_client)  # ← Groq
     return APIResponse(success=True, message="Shopping list",
-                       data={"shopping_list": state.get("assistant_message","")})
+                       data={"shopping_list": state.get("assistant_message", "")})
 
 
-# ── Cooking mode endpoints ────────────────────────────────────────────────────
+# ── Cooking (Groq) ────────────────────────────────────────────────────────────
 
 @app.post("/cooking/parse", response_model=APIResponse, tags=["Cooking"])
 async def parse_steps(req: ParseStepsRequest):
@@ -510,7 +552,7 @@ async def parse_steps(req: ParseStepsRequest):
                        data={"steps": steps, "total_steps": len(steps)})
 
 
-# ── Health advice endpoint ────────────────────────────────────────────────────
+# ── Health advice (Groq) ──────────────────────────────────────────────────────
 
 @app.post("/health/advice", response_model=APIResponse, tags=["Health"])
 async def health_advice(req: HealthAdviceRequest):
@@ -522,13 +564,13 @@ async def health_advice(req: HealthAdviceRequest):
     state = build_initial_state(user_query=req.query, user_id=uid)
     state["user_profile"] = svc["profile_db"].get_full_profile()
     state["intent"]       = "health_advice"
-    state = health_agent(state, client=_global_client)
+    state = health_agent(state, client=_global_client)  # ← Groq
     return APIResponse(success=True, message="Health advice",
-                       data={"advice":          state.get("assistant_message",""),
-                             "recommendations": state.get("health_recommendations","")})
+                       data={"advice":          state.get("assistant_message", ""),
+                             "recommendations": state.get("health_recommendations", "")})
 
 
-# ── Eco score endpoint ────────────────────────────────────────────────────────
+# ── Eco score (Groq) ──────────────────────────────────────────────────────────
 
 @app.post("/eco/calculate", response_model=APIResponse, tags=["Eco"])
 async def eco_score(req: EcoScoreRequest, user_id: str = Query("default")):
@@ -540,10 +582,10 @@ async def eco_score(req: EcoScoreRequest, user_id: str = Query("default")):
     state["recipe_ingredients_structured"] = req.ingredients
     state["user_profile"] = svc["profile_db"].get_full_profile()
     state = eco_agent(state, db=svc["db"])
-    return APIResponse(success=True, message="Eco score", data=state.get("eco_score",{}))
+    return APIResponse(success=True, message="Eco score", data=state.get("eco_score", {}))
 
 
-# ── Feedback endpoints ────────────────────────────────────────────────────────
+# ── Feedback ──────────────────────────────────────────────────────────────────
 
 @app.get("/feedback/stats", response_model=APIResponse, tags=["Feedback"])
 async def feedback_stats(user_id: str = Query("default")):
@@ -566,7 +608,10 @@ async def liked_ingredients(user_id: str = Query("default"), min_likes: int = 2)
     return APIResponse(success=True, message="Liked ingredients", data={"ingredients": liked})
 
 
-# ── Vision endpoint ───────────────────────────────────────────────────────────
+# ── Vision — image-based pantry add (Gemini) ──────────────────────────────────
+#
+# NOTE: Both /vision/analyze and /fridge/scan use Gemini (_global_gemini_model).
+#       All other endpoints above use Groq (_global_client). Nothing else changed.
 
 @app.post("/vision/analyze", response_model=APIResponse, tags=["Vision"])
 async def analyze_image(
@@ -574,24 +619,95 @@ async def analyze_image(
     context: str        = Form("fridge"),
     user_id: str        = Form("default"),
 ):
-    from vision.vision_agent import image_to_inventory, preprocess_image
+    """
+    General image analysis (fridge / pantry shelf / grocery bag / bill).
+    Uses Gemini Vision.
+    """
+    if not _global_gemini_model:
+        return APIResponse(
+            success=False,
+            message="Vision unavailable",
+            error="GEMINI_API_KEY is not configured. "
+                  "Add it to .env and restart the server.",
+        )
 
-    raw_bytes  = await file.read()
-    img_bytes, _ = preprocess_image(raw_bytes)
-    svc = _get_svc(user_id)
+    from vision.fridge_scanner import fridge_scan_pipeline
 
-    result, summary = image_to_inventory(img_bytes, svc["db"], _global_client, context)
-    result["inventory_summary"] = summary
-    return APIResponse(success=True, message="Image analyzed", data=result)
+    raw_bytes    = await file.read()
+    svc          = _get_svc(user_id)
+    user_profile = svc["profile_db"].get_full_profile()
+
+    # Re-use the same Gemini-powered pipeline for all image contexts
+    scan_result, summary = fridge_scan_pipeline(
+        image_bytes  = raw_bytes,
+        db           = svc["db"],
+        gemini_model = _global_gemini_model,   # ← Gemini only
+        user_profile = user_profile,
+    )
+    scan_result["inventory_summary"] = summary
+    return APIResponse(success=True, message="Image analyzed", data=scan_result)
 
 
-# ── Voice endpoint ────────────────────────────────────────────────────────────
+@app.post("/fridge/scan", response_model=APIResponse, tags=["Vision"])
+async def scan_fridge(
+    file:    UploadFile = File(...),
+    user_id: str        = Form(...),
+):
+    """
+    Smart Fridge Scanner.
+    Detects all food items in a fridge photo, filters them against the user's
+    dietary restrictions / health conditions / allergies (using the profile
+    stored in their DB), and adds allowed items to their pantry automatically.
+    Uses Gemini Vision — Groq is NOT used here.
+    """
+    if not _global_gemini_model:
+        return APIResponse(
+            success=False,
+            message="Fridge scanner unavailable",
+            error="GEMINI_API_KEY is not configured. "
+                  "Add it to .env and restart the server.",
+        )
+
+    try:
+        from vision.fridge_scanner import fridge_scan_pipeline
+
+        image_bytes  = await file.read()
+        svc          = _get_svc(user_id)
+        user_profile = svc["profile_db"].get_full_profile()
+
+        scan_result, summary = fridge_scan_pipeline(
+            image_bytes  = image_bytes,
+            db           = svc["db"],
+            gemini_model = _global_gemini_model,   # ← Gemini only
+            user_profile = user_profile,
+        )
+
+        return APIResponse(
+            success=True,
+            message="Fridge scanned successfully",
+            data={
+                "total_detected":    len(scan_result.get("detected_items", [])),
+                "allowed_items":     scan_result.get("allowed_items", []),
+                "blocked_items":     scan_result.get("blocked_items", []),
+                "scene_description": scan_result.get("scene_description", ""),
+                "suggested_recipes": scan_result.get("suggested_recipes", []),
+                "nutrition_tips":    scan_result.get("nutrition_tips", []),
+                "confidence":        scan_result.get("confidence", 0.0),
+                "summary":           summary,
+            },
+        )
+
+    except Exception as e:
+        return APIResponse(success=False, message="Fridge scan failed", error=str(e))
+
+
+# ── Voice (Groq Whisper) ──────────────────────────────────────────────────────
 
 @app.post("/voice/transcribe", response_model=APIResponse, tags=["Voice"])
 async def transcribe(file: UploadFile = File(...)):
     from voice.voice_agent import transcribe_audio_groq
     audio = await file.read()
-    text  = transcribe_audio_groq(audio, _global_client, file.filename)
+    text  = transcribe_audio_groq(audio, _global_client, file.filename)  # ← Groq
     return APIResponse(success=True, message="Transcribed", data={"text": text})
 
 
@@ -605,10 +721,7 @@ async def list_users():
 
 @app.delete("/admin/users/{user_id}", tags=["Admin"])
 async def purge_user(user_id: str):
-    """
-    Delete all data for a user (GDPR / admin use only).
-    Removes their database files from disk.
-    """
+    """Delete all data for a user (GDPR / admin use only)."""
     from services.user_services import evict_user_cache
     from database.user_db_manager import get_user_data_dir
     import shutil
